@@ -1,0 +1,55 @@
+{
+  "name": "pi-herdr-squad",
+  "version": "0.1.0",
+  "description": "Visible, strictly read-only Herdr investigation squads for Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jillesme/pi-herdr-squad.git"
+  },
+  "homepage": "https://github.com/jillesme/pi-herdr-squad#readme",
+  "bugs": {
+    "url": "https://github.com/jillesme/pi-herdr-squad/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "herdr",
+    "subagents",
+    "multi-agent"
+  ],
+  "files": [
+    "agent/extensions/herdr-squad",
+    "agent/skills/herdr-squad",
+    "agent/prompts/herdr-squad.md",
+    "herdr-squad.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node --experimental-strip-types --check agent/extensions/herdr-squad/index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/child.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/config.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/shared.ts",
+    "pack:check": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./agent/extensions/herdr-squad/index.ts"
+    ],
+    "skills": [
+      "./agent/skills/herdr-squad"
+    ],
+    "prompts": [
+      "./agent/prompts/herdr-squad.md"
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-squad",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Visible, strictly read-only Herdr investigation squads for Pi",
   "type": "module",
   "license": "MIT",
@@ -20,6 +20,7 @@
     "multi-agent"
   ],
   "files": [
+    "index.ts",
     "agent/extensions/herdr-squad",
     "agent/skills/herdr-squad",
     "agent/prompts/herdr-squad.md",
@@ -28,7 +29,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --experimental-strip-types --check agent/extensions/herdr-squad/index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/child.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/config.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/shared.ts",
+    "check": "node --experimental-strip-types --check index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/child.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/config.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/shared.ts",
     "pack:check": "npm pack --dry-run"
   },
   "peerDependencies": {
@@ -43,7 +44,7 @@
   },
   "pi": {
     "extensions": [
-      "./agent/extensions/herdr-squad/index.ts"
+      "./index.ts"
     ],
     "skills": [
       "./agent/skills/herdr-squad"

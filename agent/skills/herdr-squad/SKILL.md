@@ -41,6 +41,14 @@ Before launching, present a concise plan containing:
 
 Each assignment prompt must request concrete evidence and stay inside its scope.
 
+Before calling `herdr_squad_start`, verify its arguments include:
+
+- `task`: the full parent request, copied or faithfully summarized so every child receives the shared context;
+- `count`: the selected agent count;
+- `assignments`: exactly `count` entries, each with a unique `label`, exclusive `scope`, and specific `prompt`.
+
+`task` is mandatory even when the assignment prompts appear self-contained. Do not omit it or substitute the tab title for it.
+
 ## Mandatory tool sequence
 
 Tool calls must be sequential across separate model turns because Pi may execute sibling calls concurrently:

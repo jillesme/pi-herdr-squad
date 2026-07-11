@@ -217,6 +217,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Launch a visible read-only Herdr investigation squad",
 		promptGuidelines: [
 			"Call herdr_squad_start only after defining distinct non-overlapping scopes, and call it in a separate tool round before herdr_squad_wait.",
+			"Always include task with the full parent request (copied or faithfully summarized), plus count and exactly count assignments. task is required even when assignment prompts are self-contained.",
 		],
 		parameters: StartParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

@@ -443,6 +443,15 @@ export default function (pi: ExtensionAPI) {
 				for (let index = 0; index < state.agents.length; index++) {
 					if (reports[index]) continue;
 					const agent = state.agents[index];
+					if (agent.lastAgentStatus === "done") {
+						state.status = "partial";
+						state.failure = `${agent.label} (pane ${agent.paneId}) terminated with Herdr status done without submitting a report`;
+						saveState(state);
+						return {
+							content: [{ type: "text", text: `${completeCount}/${state.agents.length} reports are ready. ${state.failure}. Collect available reports and terminal output now.` }],
+							details: { ...publicSquadDetails(state), completeCount, terminated: agent.label, terminalStatus: "done", timedOut: false },
+						};
+					}
 					if (agent.lastAgentStatus === "blocked") {
 						const since = blockedSince.get(agent.agentId) ?? now;
 						blockedSince.set(agent.agentId, since);

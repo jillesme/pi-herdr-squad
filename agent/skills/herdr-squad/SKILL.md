@@ -27,6 +27,7 @@ Reduce the count if you cannot state exclusive scopes. Never use vague duplicate
 ## Model selection
 
 - If the user explicitly requests a model for the investigation, pass that exact model string in `herdr_squad_start.model`.
+- If a user-provided name is ambiguous, ask for Pi's exact model identifier rather than guessing a provider.
 - Otherwise omit `model`. The extension will resolve the project config, global config, and finally Pi's normal default.
 - Do not invent a model override merely because several agents are being launched.
 - The explicit model applies to every child in the squad.

@@ -12,7 +12,7 @@ The package creates a dedicated Herdr tab with one to four interactive Pi childr
 
 ## Install
 
-After publishing:
+Install from npm:
 
 ```bash
 pi install npm:pi-herdr-squad
@@ -25,6 +25,13 @@ pi install /absolute/path/to/pi-herdr-squad
 ```
 
 Then start a new Pi session or run `/reload`.
+
+### First use
+
+1. Run Pi inside a Herdr-managed pane.
+2. Use `/login` to authenticate, if needed, and `/model` to verify the desired model.
+3. Install the package, then start a new Pi session or run `/reload`.
+4. Start a simple squad, for example `/herdr-squad 1 inspect the package entry point`.
 
 ## Use
 
@@ -48,32 +55,24 @@ Start a two-agent Herdr squad to compare client and server validation.
 
 The parent plans non-overlapping scopes, then calls `herdr_squad_start`, `herdr_squad_wait`, and `herdr_squad_collect` sequentially. Children remain visible in their Herdr tab after collection.
 
-## Default child model
+## Child model selection
 
 The model precedence is:
 
-1. An explicit model requested for the squad.
-2. Project config at `.pi/herdr-squad.json` in a trusted project.
+1. An explicit model requested for one squad through `herdr_squad_start.model`.
+2. Trusted project config at `.pi/herdr-squad.json`.
 3. Global config at `~/.pi/agent/herdr-squad.json`.
 4. Pi's normal default model when no squad model is configured.
 
-Global example:
+Global configuration (`~/.pi/agent/herdr-squad.json`):
 
 ```json
 {
-  "defaultModel": "anthropic/claude-haiku-4-5"
+  "defaultModel": "openai-codex/gpt-5.6-terra"
 }
 ```
 
-Project example:
-
-```json
-{
-  "defaultModel": "anthropic/claude-haiku-4-5"
-}
-```
-
-A trusted project can set `defaultModel` to `null` to ignore the global squad model and use Pi's normal default:
+Trusted project configuration (`.pi/herdr-squad.json`) uses the same shape. A trusted project can bypass the global squad model and use Pi's normal default:
 
 ```json
 {
@@ -81,15 +80,27 @@ A trusted project can set `defaultModel` to `null` to ignore the global squad mo
 }
 ```
 
-Configuration is read whenever a squad starts, so changing the JSON file does not require `/reload`.
+Configuration is read whenever a squad starts, so changing the JSON file does not require `/reload`. Untrusted project configuration is ignored.
 
-To override the configured model for one investigation, say so explicitly:
+To override configuration for one investigation, request the exact model explicitly:
 
 ```text
-Start a two-agent Herdr squad using anthropic/claude-haiku-4-5 to audit the auth migration.
+Start a two-agent Herdr squad using openai-codex/gpt-5.6-terra to audit the auth migration.
 ```
 
-The skill passes explicit requests through `herdr_squad_start.model`. The selected model applies to every child in that squad. Model credentials and availability are still handled by Pi.
+The selected model applies to every child in that squad.
+
+### Choose and verify a model
+
+Copy the exact identifier recognized by Pi, generally in `provider/model` form. List available identifiers with:
+
+```bash
+pi --list-models
+```
+
+In interactive Pi, use `/login` to authenticate and `/model` to inspect or select available models. Pi also accepts compatible suffixes such as `provider/model:thinking`; squad configuration passes the value unchanged to `pi --model`.
+
+Prefer the provider-qualified identifier shown by Pi. A bare name such as `gpt-5.6-terra` can be ambiguous or resolve against an unintended provider; use `openai-codex/gpt-5.6-terra` when that is the identifier Pi shows. Pi remains responsible for resolving the identifier, credentials, and model availability; the squad extension does not preflight or duplicate Pi's model registry.
 
 ## Read-only boundary
 

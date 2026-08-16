@@ -1,7 +1,7 @@
 {
   "name": "pi-herdr-squad",
-  "version": "0.1.3",
-  "description": "Visible, strictly read-only Herdr investigation squads for Pi",
+  "version": "0.2.0",
+  "description": "Visible Herdr investigation and shared-checkout coding worker squads for Pi",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -17,19 +17,23 @@
     "pi-coding-agent",
     "herdr",
     "subagents",
-    "multi-agent"
+    "multi-agent",
+    "coding-agents",
+    "parallel-workers"
   ],
   "files": [
     "index.ts",
     "agent/extensions/herdr-squad",
     "agent/skills/herdr-squad",
+    "agent/skills/herdr-worker-squad",
     "agent/prompts/herdr-squad.md",
+    "agent/prompts/herdr-worker-squad.md",
     "herdr-squad.example.json",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --experimental-strip-types --check index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/child.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/config.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/shared.ts",
+    "check": "node --experimental-strip-types --check index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/child.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/config.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/ownership.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/shared.ts",
     "pack:check": "npm pack --dry-run"
   },
   "peerDependencies": {
@@ -47,10 +51,12 @@
       "./index.ts"
     ],
     "skills": [
-      "./agent/skills/herdr-squad"
+      "./agent/skills/herdr-squad",
+      "./agent/skills/herdr-worker-squad"
     ],
     "prompts": [
-      "./agent/prompts/herdr-squad.md"
+      "./agent/prompts/herdr-squad.md",
+      "./agent/prompts/herdr-worker-squad.md"
     ]
   }
 }

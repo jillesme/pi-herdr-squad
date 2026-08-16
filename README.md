@@ -1,70 +1,113 @@
 # pi-herdr-squad
 
-Visible, strictly read-only investigation squads for [Pi](https://github.com/earendil-works/pi-mono) running inside [Herdr](https://herdr.dev).
+Visible Investigation Squads and coding Worker Squads for [Pi](https://github.com/earendil-works/pi-mono) running inside [Herdr](https://herdr.dev).
 
-The package creates a dedicated Herdr tab with one to four interactive Pi children, assigns exclusive scopes, waits for structured reports, and gives the parent agent the evidence needed to synthesize a result.
+- **Investigation Squad:** strictly read-only parallel inspection through `/herdr-squad`.
+- **Worker Squad:** parallel coding in one shared checkout through `/herdr-worker-squad`, with exclusive writable-root ownership.
+
+Each squad supports 1-12 agents. Herdr packs agents in input order into at most three tabs, with at most four panes in each tab. The parent must select the smallest useful count from independent work units.
 
 ## Requirements
 
 - Pi with extension, skill, and prompt-template support.
-- A Pi session running in a Herdr-managed pane (`HERDR_ENV=1`).
-- Herdr's managed Pi state integration installed. Herdr normally manages `herdr-agent-state.ts` itself.
+- A Pi session in a Herdr-managed pane (`HERDR_ENV=1`).
+- Herdr's managed Pi state integration. Herdr normally manages `herdr-agent-state.ts` itself.
 
 ## Install
 
-Install from npm:
+From npm:
 
 ```bash
 pi install npm:pi-herdr-squad
 ```
 
-For local development from this checkout:
+For local development:
 
 ```bash
 pi install /absolute/path/to/pi-herdr-squad
 ```
 
-Then start a new Pi session or run `/reload`.
+Start a new Pi session or run `/reload` after installation.
 
-### First use
+## Investigation Squads
 
-1. Run Pi inside a Herdr-managed pane.
-2. Use `/login` to authenticate, if needed, and `/model` to verify the desired model.
-3. Install the package, then start a new Pi session or run `/reload`.
-4. Start a simple squad, for example `/herdr-squad 1 inspect the package entry point`.
-
-## Use
-
-Let the parent choose a conservative agent count:
+Let the parent select a conservative count:
 
 ```text
 /herdr-squad auto compare frontend and backend validation
 ```
 
-Use an exact count:
+Or request an exact count:
 
 ```text
-/herdr-squad 3 investigate checkout failures across runtime code, tests, and configuration
+/herdr-squad 5 investigate runtime, tests, configuration, observability, and dependencies
 ```
 
-Natural-language requests also load the skill when they explicitly request a Herdr squad or parallel subagents:
+The parent creates distinct investigation scopes, then calls `herdr_squad_start`, `herdr_squad_wait`, and `herdr_squad_collect` in separate sequential tool rounds.
+
+Investigation children receive only:
 
 ```text
-Start a two-agent Herdr squad to compare client and server validation.
+read, grep, find, ls, herdr_squad_report
 ```
 
-The parent plans non-overlapping scopes, then calls `herdr_squad_start`, `herdr_squad_wait`, and `herdr_squad_collect` sequentially. Children remain visible in their Herdr tab after collection.
+They cannot run shell commands or modify the checkout. The report tool writes only extension-owned JSON under a private temporary run directory.
+
+## Worker Squads
+
+Let the parent inspect the repository and select ownership groups:
+
+```text
+/herdr-worker-squad auto implement the independent CLI and documentation changes
+```
+
+Or request an exact count when that many disjoint work units exist:
+
+```text
+/herdr-worker-squad 3 implement the server handler, client component, and isolated documentation update
+```
+
+The parent must inspect the task and repository first. It gives every worker an exclusive functional scope and one or more repository-relative `writableRoots`, then calls `herdr_worker_squad_start`, `herdr_squad_wait`, and `herdr_squad_collect` in separate tool rounds. The parent does not modify worker-owned files while workers run.
+
+Worker children receive:
+
+```text
+read, bash, edit, write, grep, find, ls, herdr_squad_report
+```
+
+### Writable-root ownership
+
+A writable root identifies one file or one directory tree. It is not a glob.
+
+- Roots must be repository-relative.
+- Absolute paths, parent traversal (`..`), empty roots, duplicates, and Git metadata are rejected.
+- Roots owned by different workers cannot be equal or contain one another.
+- `.` is valid only when one worker owns the full checkout.
+- Workers can read outside their roots, but they must report a handoff instead of changing those files.
+- Shared manifests, lockfiles, registries, schemas, generated indexes, and similar integration files should have one owner or move to a later wave.
+
+The child extension resolves existing targets and nearest existing parents through `realpath`. It blocks `edit` and `write` targets outside the canonical checkout, inside Git metadata, or outside the worker's roots.
+
+### Bash is cooperative, not sandboxed
+
+Pi has no built-in shell sandbox. Writable-root enforcement covers `edit` and `write`; it cannot reliably classify every shell command. Worker prompts require bash only for inspection, tests, builds, and validation. Workers must not use it for broad formatters, generators, dependency installation, destructive Git commands, or changes outside their ownership.
+
+Worker squads are for trusted local coding work, not hostile isolation. After collection, the parent must inspect the actual checkout diff and run aggregate validation. A worker report alone is not proof that the checkout is correct.
+
+## Multi-tab behavior
+
+Herdr creates `Math.ceil(agentCount / 4)` tabs and retains them after completion or partial failure for inspection. Background tabs stay unfocused. With `focus: true`, the first squad tab is focused only after all children start. Shared wait and collect tools find reports and terminal fallbacks across all tabs.
 
 ## Child model selection
 
-The model precedence is:
+Model precedence for both squad types is:
 
-1. An explicit model requested for one squad through `herdr_squad_start.model`.
+1. An explicit `model` passed to the start tool.
 2. Trusted project config at `.pi/herdr-squad.json`.
 3. Global config at `~/.pi/agent/herdr-squad.json`.
-4. Pi's normal default model when no squad model is configured.
+4. Pi's normal default.
 
-Global configuration (`~/.pi/agent/herdr-squad.json`):
+Configuration shape:
 
 ```json
 {
@@ -72,7 +115,7 @@ Global configuration (`~/.pi/agent/herdr-squad.json`):
 }
 ```
 
-Trusted project configuration (`.pi/herdr-squad.json`) uses the same shape. A trusted project can bypass the global squad model and use Pi's normal default:
+A trusted project can bypass the global model and use Pi's default:
 
 ```json
 {
@@ -80,45 +123,29 @@ Trusted project configuration (`.pi/herdr-squad.json`) uses the same shape. A tr
 }
 ```
 
-Configuration is read whenever a squad starts, so changing the JSON file does not require `/reload`. Untrusted project configuration is ignored.
+Configuration is read each time a squad starts. Untrusted project configuration is ignored. The selected model applies to every child in one squad.
 
-To override configuration for one investigation, request the exact model explicitly:
-
-```text
-Start a two-agent Herdr squad using openai-codex/gpt-5.6-terra to audit the auth migration.
-```
-
-The selected model applies to every child in that squad.
-
-### Choose and verify a model
-
-Copy the exact identifier recognized by Pi, generally in `provider/model` form. List available identifiers with:
+Use the exact identifier recognized by Pi, usually in `provider/model` form:
 
 ```bash
 pi --list-models
 ```
 
-In interactive Pi, use `/login` to authenticate and `/model` to inspect or select available models. Pi also accepts compatible suffixes such as `provider/model:thinking`; squad configuration passes the value unchanged to `pi --model`.
+Pi remains responsible for model resolution, credentials, and availability.
 
-Prefer the provider-qualified identifier shown by Pi. A bare name such as `gpt-5.6-terra` can be ambiguous or resolve against an unintended provider; use `openai-codex/gpt-5.6-terra` when that is the identifier Pi shows. Pi remains responsible for resolving the identifier, credentials, and model availability; the squad extension does not preflight or duplicate Pi's model registry.
+## State compatibility
 
-## Read-only boundary
+Squad state is stored in Pi session entries. Version-1 read-only squad snapshots are migrated in memory when a session reloads, so existing investigation squad IDs remain usable by wait and collect.
 
-Every child receives exactly these active tools:
-
-```text
-read, grep, find, ls, herdr_squad_report
-```
-
-Children do not receive `bash`, `edit`, or `write`. The report tool writes only an extension-owned JSON report under a private temporary run directory; it cannot modify the shared checkout.
-
-Task text is stored in mode-`0600` prompt files and is never interpolated into shell commands. Tab and pane identities are revalidated before terminal fallbacks are read.
+Task text is stored in mode-`0600` prompt files and is never interpolated directly into shell commands. Per-agent identity tokens protect report submission.
 
 ## Package contents
 
-- `agent/extensions/herdr-squad/` — parent orchestration and child reporting.
-- `agent/skills/herdr-squad/SKILL.md` — delegation and synthesis policy.
-- `agent/prompts/herdr-squad.md` — `/herdr-squad` entry point.
+- `agent/extensions/herdr-squad/` — shared parent orchestration, ownership checks, and child reporting.
+- `agent/skills/herdr-squad/SKILL.md` — Investigation Squad policy.
+- `agent/skills/herdr-worker-squad/SKILL.md` — Worker Squad ownership and coordination policy.
+- `agent/prompts/herdr-squad.md` — `/herdr-squad`.
+- `agent/prompts/herdr-worker-squad.md` — `/herdr-worker-squad`.
 
 ## Development checks
 
@@ -127,7 +154,7 @@ npm run check
 npm run pack:check
 ```
 
-The package has no third-party runtime dependencies. Pi-provided APIs are declared as peer dependencies.
+The package has no third-party runtime dependencies. Pi-provided APIs are peer dependencies.
 
 ## License
 

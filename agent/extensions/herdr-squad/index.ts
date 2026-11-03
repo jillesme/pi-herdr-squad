@@ -172,7 +172,12 @@ interface StartInput {
 type SquadCheck =
 	| { kind: "complete"; completeCount: number }
 	| { kind: "pending"; completeCount: number; running: string[] }
-	| { kind: "problem"; completeCount: number; message: string; details: JsonObject };
+	| { kind: "problem"; completeCount: number; message: string; details: JsonObject; running: string[] };
+
+// Identifies a problem the parent has already been told about; a new report or a new problem changes it.
+function problemKey(check: Extract<SquadCheck, { kind: "problem" }>): string {
+	return `${check.completeCount}:${check.message}`;
+}
 
 function cleanBody(value: string, maxLength: number): string {
 	return value.replace(/\u0000/g, "").trim().slice(0, maxLength);
@@ -377,9 +382,12 @@ export default function (pi: ExtensionAPI) {
 		// A reported child's pane may already have been closed; only missing
 		// children whose results are still outstanding prevent completion.
 		const missingAgents = state.agents.filter((agent, index) => !reports[index] && live.missing.includes(agent.label));
+		// Collect every problem instead of stopping at the first, so the remaining agents stay tracked.
+		const problems: string[] = [];
+		const details: JsonObject = {};
 		if (missingAgents.length > 0) {
-			const problems = [`Missing panes: ${missingAgents.map((agent) => agent.label).join(", ")}`];
-			return { kind: "problem", completeCount, message: problems.join("; ") || "Squad tabs are no longer available", details: {} };
+			problems.push(`Missing panes: ${missingAgents.map((agent) => agent.label).join(", ")}`);
+			details.missing = missingAgents.map((agent) => agent.label);
 		}
 
 		const now = Date.now();
@@ -387,6 +395,7 @@ export default function (pi: ExtensionAPI) {
 		for (let index = 0; index < state.agents.length; index++) {
 			if (reports[index]) continue;
 			const agent = state.agents[index];
+			if (missingAgents.includes(agent)) continue;
 			const key = `${state.squadId}:${agent.agentId}`;
 			const status = agent.lastAgentStatus ?? "unknown";
 			const previous = statusSince.get(key);
@@ -395,18 +404,21 @@ export default function (pi: ExtensionAPI) {
 			if (status === "working") seenWorking.add(key);
 
 			if (status === "blocked" && now - since >= BLOCKED_GRACE_MS) {
-				return { kind: "problem", completeCount, message: `${agent.label} is blocked in ${agent.tabLabel}`, details: { blocked: agent.label } };
+				problems.push(`${agent.label} is blocked in ${agent.tabLabel}`);
+				(details.blocked ??= []).push(agent.label);
+				continue;
 			}
 			const finished = status === "done" || status === "idle";
 			if (finished && now - since >= (seenWorking.has(key) ? FINISHED_GRACE_MS : STARTUP_IDLE_GRACE_MS)) {
-				return {
-					kind: "problem",
-					completeCount,
-					message: `${agent.label} (pane ${agent.paneId}, tab ${agent.tabLabel}) finished with Herdr status ${status} without submitting a report`,
-					details: { terminated: agent.label, terminalStatus: status },
-				};
+				problems.push(`${agent.label} (pane ${agent.paneId}, tab ${agent.tabLabel}) finished with Herdr status ${status} without submitting a report`);
+				(details.terminated ??= []).push(agent.label);
+				continue;
 			}
 			running.push(agent.label);
+		}
+		if (problems.length > 0) {
+			const stillRunning = running.length > 0 ? `; still running: ${running.join(", ")}` : "";
+			return { kind: "problem", completeCount, message: `${problems.join("; ")}${stillRunning}`, details, running };
 		}
 		return { kind: "pending", completeCount, running };
 	}
@@ -426,7 +438,6 @@ export default function (pi: ExtensionAPI) {
 	function watchSquad(squadId: string): void {
 		if (watchers.has(squadId)) return;
 		let busy = false;
-		let lastProblem: string | undefined;
 		const timer = setInterval(async () => {
 			const state = squads.get(squadId);
 			if (!state || (state.status !== "running" && state.status !== "partial")) {
@@ -441,21 +452,25 @@ export default function (pi: ExtensionAPI) {
 				// Shutdown, steering or another tool may have changed state while I/O was in flight.
 				if (watchers.get(squadId) !== timer || state.updatedAt !== revision || waiting.has(squadId)) return;
 				if (check.kind === "pending") {
-					lastProblem = undefined;
+					// The problem cleared (for example a blocked child resumed); a recurrence is news again.
+					delete state.notifiedProblem;
 					return;
 				}
-				if (check.kind === "problem" && lastProblem === check.message) return;
+				// The parent already saw this exact problem, from a notification or a wait result.
+				if (check.kind === "problem" && state.notifiedProblem === problemKey(check)) return;
 				let text: string;
 				if (check.kind === "complete") {
 					stopWatching(squadId);
 					state.status = "completed";
 					delete state.failure;
+					delete state.notifiedProblem;
 					text = `Herdr squad "${state.title}" finished: all ${check.completeCount} reports are ready. Call herdr_squad_collect with squadId ${state.squadId}.`;
 				} else {
-					lastProblem = check.message;
+					state.notifiedProblem = problemKey(check);
 					state.status = "partial";
 					state.failure = check.message;
-					text = `Herdr squad "${state.title}" needs attention: ${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Call herdr_squad_collect with squadId ${state.squadId} to see reports and terminal output.`;
+					const more = check.running.length > 0 ? " Running agents are still watched; you will be notified as more reports arrive." : "";
+					text = `Herdr squad "${state.title}" needs attention: ${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Call herdr_squad_collect with squadId ${state.squadId} to see reports and terminal output.${more}`;
 				}
 				saveState(state);
 				pi.sendMessage(
@@ -779,21 +794,24 @@ export default function (pi: ExtensionAPI) {
 					if (check.kind === "complete") {
 						state.status = "completed";
 						delete state.failure;
+						delete state.notifiedProblem;
 						saveState(state);
 						return {
 							content: [{ type: "text", text: `All ${check.completeCount} Herdr squad reports are ready. Call herdr_squad_collect with squadId ${state.squadId} in the next tool round.` }],
 							details: { ...publicSquadDetails(state), completeCount: check.completeCount, timedOut: false },
 						};
 					}
-					if (check.kind === "problem") {
+					// A problem the parent already knows about does not end the wait while other agents still run.
+					if (check.kind === "problem" && (state.notifiedProblem !== problemKey(check) || check.running.length === 0)) {
 						state.status = "partial";
 						state.failure = check.message;
+						state.notifiedProblem = problemKey(check);
 						saveState(state);
 						return {
 							content: [
 								{ type: "text", text: `${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Collect available reports and terminal output now.` },
 							],
-							details: { ...publicSquadDetails(state), ...check.details, completeCount: check.completeCount, timedOut: false },
+							details: { ...publicSquadDetails(state), ...check.details, completeCount: check.completeCount, running: check.running, timedOut: false },
 						};
 					}
 
@@ -997,6 +1015,8 @@ export default function (pi: ExtensionAPI) {
 				state.status = "running";
 				delete state.failure;
 			}
+			// The steered child may resolve or repeat a known problem; either outcome is news.
+			delete state.notifiedProblem;
 			saveState(state);
 			watchSquad(state.squadId);
 

@@ -102,7 +102,7 @@ Worker squads are for trusted local coding work, not hostile isolation. After co
 | --- | --- |
 | `herdr_squad_start` | Launch a read-only investigation squad. |
 | `herdr_worker_squad_start` | Launch a shared-checkout worker squad. |
-| `herdr_squad_wait` | Block until every report is in, a child is blocked or finished without a report, or the timeout passes. A timeout does not stop the agents. |
+| `herdr_squad_wait` | Block until every report is in, a new problem appears (a child is blocked, finished without a report, or lost its pane), or the timeout passes. A problem the parent was already told about does not end the wait while other agents still run. A timeout does not stop the agents. |
 | `herdr_squad_status` | Non-blocking progress check: reports ready and each agent's Herdr status. |
 | `herdr_squad_collect` | Collect structured reports, with terminal tails for missing ones. Agents that are still running are listed as pending. |
 | `herdr_squad_steer` | Send a correction or follow-up message to one child. A child that already reported reports again. |
@@ -110,7 +110,7 @@ Worker squads are for trusted local coding work, not hostile isolation. After co
 
 ## Completion notifications
 
-The parent does not need to block on `herdr_squad_wait`. While a squad runs, the extension checks it in the background and sends a follow-up message to the parent session when every report is ready, or when a child is blocked, finished without a report, or lost its pane. The parent can keep working on independent tasks and collect when notified. Partially collected squads stay watched until the remaining agents finish, including children still starting up. A blocked or missing-child notification does not stop monitoring: a later completion still notifies the parent. Transient Herdr CLI failures are retried rather than treated as missing panes.
+The parent does not need to block on `herdr_squad_wait`. While a squad runs, the extension checks it in the background and sends a follow-up message to the parent session when every report is ready, or when a child is blocked, finished without a report, or lost its pane. The parent can keep working on independent tasks and collect when notified. Partially collected squads stay watched until the remaining agents finish, including children still starting up. A problem notification does not stop monitoring: each further report sends another notification, and the same problem is never announced twice (including after a wait already returned it or a collect). Transient Herdr CLI failures are retried rather than treated as missing panes.
 
 ## Steering
 

@@ -74,6 +74,8 @@ export interface SquadState {
 	status: SquadLifecycle;
 	agents: SquadAgentState[];
 	failure?: string;
+	/** Report count and problem text the parent was last told about, so notifications are not repeated. */
+	notifiedProblem?: string;
 	collectedAt?: string;
 }
 

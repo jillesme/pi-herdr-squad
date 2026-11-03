@@ -12,13 +12,13 @@ export interface ResolvedModelConfig {
 	path?: string;
 }
 
-function validateModel(value: unknown, path: string): string | undefined {
+function validateModel(value: unknown, field: string): string | undefined {
 	if (value === undefined || value === null) return undefined;
-	if (typeof value !== "string") throw new Error(`defaultModel in ${path} must be a string or null`);
+	if (typeof value !== "string") throw new Error(`${field} must be a string or null`);
 	const model = value.trim();
-	if (!model) throw new Error(`defaultModel in ${path} must not be empty`);
+	if (!model) throw new Error(`${field} must not be empty`);
 	if (model.length > 200 || /[\u0000-\u001f\u007f]/.test(model)) {
-		throw new Error(`defaultModel in ${path} contains invalid characters or exceeds 200 characters`);
+		throw new Error(`${field} contains invalid characters or exceeds 200 characters`);
 	}
 	return model;
 }
@@ -44,7 +44,7 @@ async function readConfig(path: string): Promise<{ exists: boolean; model?: stri
 	const config = parsed as HerdrSquadConfig;
 	return {
 		exists: true,
-		model: validateModel(config.defaultModel, path),
+		model: validateModel(config.defaultModel, `defaultModel in ${path}`),
 		explicitlyDisabled: config.defaultModel === null,
 	};
 }

@@ -263,6 +263,13 @@ export default function (pi: ExtensionAPI) {
 
 	const squads = new Map<string, SquadState>();
 
+	async function readAgentReport(state: SquadState, agent: SquadAgentState) {
+		const report = await readSquadReport(agent.reportPath);
+		if (!report || report.squadId !== state.squadId || report.agentId !== agent.agentId) return undefined;
+		if (agent.pendingSteerId && report.steerId !== agent.pendingSteerId) return undefined;
+		return report;
+	}
+
 	function saveState(state: SquadState): void {
 		state.updatedAt = new Date().toISOString();
 		squads.set(state.squadId, state);
@@ -296,14 +303,9 @@ export default function (pi: ExtensionAPI) {
 		state: SquadState,
 		signal?: AbortSignal,
 	): Promise<{ allTabsFound: boolean; missingTabs: string[]; missing: string[] }> {
-		let listedTabs: JsonObject[] = [];
-		try {
-			const response = await herdr(["tab", "list", "--workspace", state.workspaceId], signal);
-			listedTabs = response.result?.tabs ?? [];
-		} catch {
-			if (signal?.aborted) throw new Error("Herdr squad operation cancelled");
-			return { allTabsFound: false, missingTabs: state.tabs.map((tab) => tab.tabLabel), missing: state.agents.map((agent) => agent.label) };
-		}
+		// A failed CLI request is not evidence that the tabs disappeared; let the watcher retry.
+		const tabResponse = await herdr(["tab", "list", "--workspace", state.workspaceId], signal);
+		const listedTabs: JsonObject[] = tabResponse.result?.tabs ?? [];
 
 		const foundTabs = new Map<string, SquadTabState>();
 		const missingTabs: string[] = [];
@@ -322,14 +324,8 @@ export default function (pi: ExtensionAPI) {
 			if (!foundTabs.has(plannedLabel) && !missingTabs.includes(plannedLabel)) missingTabs.push(plannedLabel);
 		}
 
-		let panes: JsonObject[] = [];
-		try {
-			const response = await herdr(["pane", "list", "--workspace", state.workspaceId], signal);
-			panes = response.result?.panes ?? [];
-		} catch {
-			if (signal?.aborted) throw new Error("Herdr squad operation cancelled");
-			return { allTabsFound: missingTabs.length === 0, missingTabs, missing: state.agents.map((agent) => agent.label) };
-		}
+		const paneResponse = await herdr(["pane", "list", "--workspace", state.workspaceId], signal);
+		const panes: JsonObject[] = paneResponse.result?.panes ?? [];
 
 		const panesByTabAndLabel = new Map<string, JsonObject>();
 		for (const pane of panes) {
@@ -360,16 +356,29 @@ export default function (pi: ExtensionAPI) {
 	const statusSince = new Map<string, { status: string; since: number }>();
 	const seenWorking = new Set<string>();
 
+	function mayBeRunning(state: SquadState, agent: SquadAgentState): boolean {
+		const status = agent.lastAgentStatus ?? "unknown";
+		if (status !== "idle" && status !== "done") return true;
+		const key = `${state.squadId}:${agent.agentId}`;
+		const previous = statusSince.get(key);
+		if (previous?.status !== status) {
+			statusSince.set(key, { status, since: Date.now() });
+			return true;
+		}
+		return Date.now() - previous.since < (seenWorking.has(key) ? FINISHED_GRACE_MS : STARTUP_IDLE_GRACE_MS);
+	}
+
 	async function checkSquad(state: SquadState, signal?: AbortSignal): Promise<SquadCheck> {
-		const reports = await Promise.all(state.agents.map((agent) => readSquadReport(agent.reportPath)));
+		const reports = await Promise.all(state.agents.map((agent) => readAgentReport(state, agent)));
 		const completeCount = reports.filter(Boolean).length;
 		if (completeCount === state.agents.length) return { kind: "complete", completeCount };
 
 		const live = await refreshLivePanes(state, signal);
-		if (!live.allTabsFound || live.missing.length > 0) {
-			const problems: string[] = [];
-			if (live.missingTabs.length > 0) problems.push(`Missing tabs: ${live.missingTabs.join(", ")}`);
-			if (live.missing.length > 0) problems.push(`Missing panes: ${live.missing.join(", ")}`);
+		// A reported child's pane may already have been closed; only missing
+		// children whose results are still outstanding prevent completion.
+		const missingAgents = state.agents.filter((agent, index) => !reports[index] && live.missing.includes(agent.label));
+		if (missingAgents.length > 0) {
+			const problems = [`Missing panes: ${missingAgents.map((agent) => agent.label).join(", ")}`];
 			return { kind: "problem", completeCount, message: problems.join("; ") || "Squad tabs are no longer available", details: {} };
 		}
 
@@ -417,24 +426,33 @@ export default function (pi: ExtensionAPI) {
 	function watchSquad(squadId: string): void {
 		if (watchers.has(squadId)) return;
 		let busy = false;
+		let lastProblem: string | undefined;
 		const timer = setInterval(async () => {
 			const state = squads.get(squadId);
-			if (!state || state.status !== "running") {
+			if (!state || (state.status !== "running" && state.status !== "partial")) {
 				stopWatching(squadId);
 				return;
 			}
 			if (busy || waiting.has(squadId)) return;
 			busy = true;
 			try {
+				const revision = state.updatedAt;
 				const check = await checkSquad(state);
-				if (check.kind === "pending" || state.status !== "running" || waiting.has(squadId)) return;
-				stopWatching(squadId);
+				// Shutdown, steering or another tool may have changed state while I/O was in flight.
+				if (watchers.get(squadId) !== timer || state.updatedAt !== revision || waiting.has(squadId)) return;
+				if (check.kind === "pending") {
+					lastProblem = undefined;
+					return;
+				}
+				if (check.kind === "problem" && lastProblem === check.message) return;
 				let text: string;
 				if (check.kind === "complete") {
+					stopWatching(squadId);
 					state.status = "completed";
 					delete state.failure;
 					text = `Herdr squad "${state.title}" finished: all ${check.completeCount} reports are ready. Call herdr_squad_collect with squadId ${state.squadId}.`;
 				} else {
+					lastProblem = check.message;
 					state.status = "partial";
 					state.failure = check.message;
 					text = `Herdr squad "${state.title}" needs attention: ${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Call herdr_squad_collect with squadId ${state.squadId} to see reports and terminal output.`;
@@ -462,7 +480,7 @@ export default function (pi: ExtensionAPI) {
 			.filter((state): state is SquadState => state !== undefined)
 			.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
 		for (const state of snapshots) squads.set(state.squadId, state);
-		for (const state of squads.values()) if (state.status === "running") watchSquad(state.squadId);
+		for (const state of squads.values()) if (state.status === "running" || state.status === "partial") watchSquad(state.squadId);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -515,7 +533,7 @@ export default function (pi: ExtensionAPI) {
 		let model: string | undefined;
 		let modelSource: SquadState["modelSource"];
 		if (params.model) {
-			model = validateExplicitModel(params.model);
+			model = validateExplicitModel(params.model, kind === "worker" ? "herdr_worker_squad_start.model" : "herdr_squad_start.model");
 			modelSource = "explicit";
 		} else {
 			const configuredModel = await resolveConfiguredModel(checkoutRoot, ctx.isProjectTrusted());
@@ -745,9 +763,11 @@ export default function (pi: ExtensionAPI) {
 			"Call herdr_squad_wait only after a Herdr squad start tool has returned a squadId, and wait for its result before calling herdr_squad_collect.",
 			"Do not poll herdr_squad_wait with short timeouts. To keep working while a squad runs, skip waiting and act on the automatic squad follow-up message; use herdr_squad_status for a quick non-blocking check.",
 		],
+		executionMode: "sequential",
 		parameters: SquadIdParams,
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const state = getSquad(params.squadId);
+			if (state.status === "closed") throw new Error("Cannot wait on a closed squad; collect its saved reports instead");
 			const timeoutMs = params.timeoutMs ?? DEFAULT_WAIT_MS;
 			const deadline = Date.now() + timeoutMs;
 
@@ -783,7 +803,7 @@ export default function (pi: ExtensionAPI) {
 					});
 					if (Date.now() >= deadline) {
 						// Agents keep running after a timeout; the watcher notifies the parent when they finish.
-						if (state.status === "running") watchSquad(state.squadId);
+						watchSquad(state.squadId);
 						return {
 							content: [
 								{
@@ -798,6 +818,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			} finally {
 				waiting.delete(state.squadId);
+				if (state.status === "running" || state.status === "partial") watchSquad(state.squadId);
 			}
 		},
 	});
@@ -812,7 +833,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: StatusParams,
 		async execute(_toolCallId, params, signal) {
 			const state = getSquad(params.squadId);
-			const reports = await Promise.all(state.agents.map((agent) => readSquadReport(agent.reportPath)));
+			const reports = await Promise.all(state.agents.map((agent) => readAgentReport(state, agent)));
 			const live = await refreshLivePanes(state, signal);
 			const missing = new Set(live.missing);
 			const completeCount = reports.filter(Boolean).length;
@@ -839,6 +860,7 @@ export default function (pi: ExtensionAPI) {
 			`Collect structured reports from an investigation or worker squad, with bounded terminal-tail fallbacks. Output is limited to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; complete output is saved when truncated. Call only after herdr_squad_wait returns.`,
 		promptSnippet: "Collect a Herdr squad's reports and fallback terminal output",
 		promptGuidelines: ["Call herdr_squad_collect only after the corresponding herdr_squad_wait call has returned."],
+		executionMode: "sequential",
 		parameters: CollectParams,
 		async execute(_toolCallId, params, signal) {
 			const state = getSquad(params.squadId);
@@ -852,14 +874,14 @@ export default function (pi: ExtensionAPI) {
 			let structuredCount = 0;
 
 			for (const agent of state.agents) {
-				const report = await readSquadReport(agent.reportPath);
+				const report = await readAgentReport(state, agent);
 				let section: string;
-				if (report && report.squadId === state.squadId && report.agentId === agent.agentId) {
+				if (report) {
 					structuredCount++;
 					section = formatReport(report, agent.reportPath, state.kind, agent.writableRoots);
 				} else {
 					const paneLive = !missingTabs.has(agent.tabLabel) && !missingPanes.has(agent.label) && Boolean(agent.paneId);
-					const running = paneLive && (agent.lastAgentStatus === "working" || agent.lastAgentStatus === "blocked");
+					const running = paneLive && mayBeRunning(state, agent);
 					if (running) stillRunning.push(agent.label);
 					let transcript = missingTabs.has(agent.tabLabel)
 						? `Terminal output unavailable because tab ${agent.tabLabel} could not be revalidated.`
@@ -909,8 +931,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Keep watching a partially collected squad so the parent hears when the rest finish.
-			if (stillRunning.length === 0) state.status = "collected";
-			else if (state.status === "running") watchSquad(state.squadId);
+			if (state.status !== "closed") {
+				if (structuredCount === state.agents.length || stillRunning.length === 0) state.status = "collected";
+				else {
+					state.status = "running";
+					watchSquad(state.squadId);
+				}
+			}
 			if (structuredCount === state.agents.length) delete state.failure;
 			state.collectedAt = new Date().toISOString();
 			saveState(state);
@@ -931,6 +958,7 @@ export default function (pi: ExtensionAPI) {
 			"Use herdr_squad_steer to redirect a squad child or ask it a follow-up instead of starting a new squad for the same scope.",
 			"Keep herdr_squad_steer messages within the child's original scope and ownership; start a new squad for different work.",
 		],
+		executionMode: "sequential",
 		parameters: SteerParams,
 		async execute(_toolCallId, params, signal) {
 			const state = getSquad(params.squadId);
@@ -953,12 +981,13 @@ export default function (pi: ExtensionAPI) {
 				await rename(agent.reportPath, supersededReport);
 			}
 
-			const steer: SquadSteerMessage = { version: 1, squadId: state.squadId, agentId: agent.agentId, message, createdAt: new Date().toISOString() };
+			const steer: SquadSteerMessage = { version: 1, id: randomUUID(), squadId: state.squadId, agentId: agent.agentId, message, createdAt: new Date().toISOString() };
 			const fileName = `${steerFilePrefix(agent.agentId)}${Date.now()}-${randomBytes(4).toString("hex")}.json`;
 			const steerPath = join(state.runDir, fileName);
 			const temporaryPath = join(state.runDir, `.${fileName}.tmp`);
 			await writeFile(temporaryPath, `${JSON.stringify(steer, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 			await rename(temporaryPath, steerPath);
+			agent.pendingSteerId = steer.id;
 
 			// The child restarts work, so forget its finished status and resume watching the squad.
 			const key = `${state.squadId}:${agent.agentId}`;
@@ -1008,15 +1037,16 @@ export default function (pi: ExtensionAPI) {
 			"Close a squad's Herdr tabs after its results are collected. Refuses while agents are still running unless force is true. Reports and terminal snapshots stay on disk.",
 		promptSnippet: "Close a finished Herdr squad's tabs",
 		promptGuidelines: ["Call herdr_squad_close after herdr_squad_collect when the squad's tabs are no longer needed for inspection."],
+		executionMode: "sequential",
 		parameters: CloseParams,
 		async execute(_toolCallId, params, signal) {
 			const state = getSquad(params.squadId);
-			const reports = await Promise.all(state.agents.map((agent) => readSquadReport(agent.reportPath)));
+			const reports = await Promise.all(state.agents.map((agent) => readAgentReport(state, agent)));
 			const live = await refreshLivePanes(state, signal);
 			const missingPanes = new Set(live.missing);
 			const active = state.agents.filter(
-				(agent, index) =>
-					!reports[index] && !missingPanes.has(agent.label) && (agent.lastAgentStatus === "working" || agent.lastAgentStatus === "blocked"),
+				(agent, index) => !missingPanes.has(agent.label) &&
+					(agent.lastAgentStatus === "working" || agent.lastAgentStatus === "blocked" || (!reports[index] && mayBeRunning(state, agent))),
 			);
 			if (active.length > 0 && params.force !== true) {
 				throw new Error(`Agents are still running: ${active.map((agent) => agent.label).join(", ")}. Collect first, or pass force: true to close anyway.`);
@@ -1036,7 +1066,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			stopWatching(state.squadId);
-			state.status = "closed";
+			state.status = failures.length > 0 ? "partial" : "closed";
+			if (failures.length > 0) state.failure = failures.join("; ");
+			else delete state.failure;
 			saveState(state);
 			const failureText = failures.length > 0 ? `\nFailed to close:\n${formatList(failures)}` : "";
 			return {

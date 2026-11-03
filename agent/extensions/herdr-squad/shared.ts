@@ -15,6 +15,8 @@ export const STEER_DELIVERED_SUFFIX = ".delivered";
 
 export interface SquadSteerMessage {
 	version: 1;
+	/** Unique revision echoed by the child's updated report. */
+	id?: string;
 	squadId: string;
 	agentId: string;
 	message: string;
@@ -48,6 +50,8 @@ export interface SquadAgentState {
 	/** Per-assignment model override; children without one use the squad model. */
 	model?: string;
 	lastAgentStatus?: string;
+	/** Only a report acknowledging this steering revision is current. */
+	pendingSteerId?: string;
 }
 
 export interface SquadState {
@@ -102,6 +106,7 @@ export interface SquadValidationResult {
 
 export interface SquadReport {
 	version: 1;
+	steerId?: string;
 	squadId: string;
 	agentId: string;
 	label: string;

@@ -9,7 +9,7 @@ Each squad supports 1-12 agents. Herdr packs agents in input order into at most 
 
 ## Requirements
 
-- Pi with extension, skill, and prompt-template support.
+- Pi 1.5.0 or newer (uses `agent_before_settle` and sequential tool execution).
 - A Pi session in a Herdr-managed pane (`HERDR_ENV=1`).
 - Herdr's managed Pi state integration. Herdr normally manages `herdr-agent-state.ts` itself.
 
@@ -110,11 +110,11 @@ Worker squads are for trusted local coding work, not hostile isolation. After co
 
 ## Completion notifications
 
-The parent does not need to block on `herdr_squad_wait`. While a squad runs, the extension checks it in the background and sends a follow-up message to the parent session when every report is ready, or when a child is blocked, finished without a report, or lost its pane. The parent can keep working on independent tasks and collect when notified. Partially collected squads stay watched until the remaining agents finish.
+The parent does not need to block on `herdr_squad_wait`. While a squad runs, the extension checks it in the background and sends a follow-up message to the parent session when every report is ready, or when a child is blocked, finished without a report, or lost its pane. The parent can keep working on independent tasks and collect when notified. Partially collected squads stay watched until the remaining agents finish, including children still starting up. A blocked or missing-child notification does not stop monitoring: a later completion still notifies the parent. Transient Herdr CLI failures are retried rather than treated as missing panes.
 
 ## Steering
 
-`herdr_squad_steer` sends a message to one child by label. The parent writes it to the private run directory and the child's squad extension delivers it as a user message: while the child works, it arrives after the current tool calls; when the child is idle or has already reported, it starts a new turn. If the child already reported, that report is renamed to `report-<agent>.superseded-<time>.json` and the squad goes back to running, so the parent is notified again when the updated report arrives. You can also type into a child's pane directly.
+`herdr_squad_steer` sends a message to one child by label. The parent writes it to the private run directory and the child's squad extension delivers it as a user message: while the child works, it arrives after the current tool calls; when the child is idle or has already reported, it starts a new turn. If the child already reported, that report is renamed to `report-<agent>.superseded-<time>.json` and the squad goes back to running, so the parent is notified again when the updated report arrives. Reports acknowledge the latest steering revision only after the child model receives the message, so an in-flight report cannot satisfy a newer follow-up. A delivery acknowledgment means Pi accepted the message, not that the child has finished acting on it. You can also type into a child's pane directly.
 
 ## Parent context
 
@@ -157,7 +157,7 @@ A trusted project can bypass the global model and use Pi's default:
 }
 ```
 
-Configuration is read each time a squad starts. Untrusted project configuration is ignored. The squad model applies to every child without an assignment `model`; mix models in one squad by setting `model` on individual assignments (for example a cheaper model for a mechanical scope and a stronger one for a subtle one).
+Configuration is read each time a squad starts. The project config path is relative to the session's working directory, not searched upward from a subdirectory. Untrusted project configuration is ignored. The squad model applies to every child without an assignment `model`; mix models in one squad by setting `model` on individual assignments (for example a cheaper model for a mechanical scope and a stronger one for a subtle one).
 
 Use the exact identifier recognized by Pi, usually in `provider/model` form:
 

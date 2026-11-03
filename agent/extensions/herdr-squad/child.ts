@@ -10,6 +10,7 @@ import {
 	MANIFEST_FILE,
 	RUN_DIR_PREFIX,
 	reportFileName,
+	readSquadReport,
 	STEER_DELIVERED_SUFFIX,
 	steerFilePrefix,
 	type SquadKind,
@@ -21,6 +22,7 @@ import {
 const MAX_FINDINGS_LENGTH = 20_000;
 const MAX_NUDGES = 2;
 const STEER_POLL_MS = 1_000;
+const STEER_ENTRY_TYPE = "herdr-squad-steer";
 
 const ChangedFileParams = Type.Object({
 	path: Type.String({ description: "Path of a file created or modified by this worker, repository-relative or absolute inside the checkout", minLength: 1, maxLength: 1000 }),
@@ -120,7 +122,27 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 	// A child that ends its run without a report looks finished to the parent but returns nothing.
 	// Continue the same run with a reminder so Herdr keeps showing it as working.
 	let reported = false;
+	let steerId: string | undefined;
+	let deliveredSteerId: string | undefined;
 	let nudges = 0;
+	// Delivery can happen during an old tool batch. Only acknowledge the revision
+	// after the model has actually received its message, not merely when queued.
+	const steeringMarkers = new Map<string, string>();
+	pi.on("context", (event) => {
+		if (steeringMarkers.size === 0) return;
+		for (const message of event.messages) {
+			if (message.role !== "user") continue;
+			const text = typeof message.content === "string"
+				? message.content
+				: message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			for (const [marker, id] of steeringMarkers) {
+				if (text.includes(marker)) {
+					steerId = id;
+					steeringMarkers.delete(marker);
+				}
+			}
+		}
+	});
 	pi.on("agent_before_settle", (event) => {
 		if (reported || event.outcome === "aborted" || nudges >= MAX_NUDGES) return undefined;
 		nudges++;
@@ -153,6 +175,7 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 			await validate();
 			const names = (await readdir(steerDir)).filter((name) => name.startsWith(prefix) && name.endsWith(".json")).sort();
 			for (const name of names) {
+				if (!sessionCtx) return;
 				const path = join(steerDir, name);
 				let steer: Partial<SquadSteerMessage>;
 				try {
@@ -160,15 +183,21 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 				} catch {
 					continue;
 				}
-				// Mark delivered first so a slow turn never receives the same message twice.
-				await rename(path, `${path}${STEER_DELIVERED_SUFFIX}`);
-				if (steer.version !== 1 || steer.squadId !== squadId || steer.agentId !== agentId || typeof steer.message !== "string") continue;
+				if (!steer || steer.version !== 1 || steer.squadId !== squadId || steer.agentId !== agentId || typeof steer.message !== "string") continue;
 				// A steered child must report again, even if it already reported.
 				reported = false;
+				deliveredSteerId = typeof steer.id === "string" ? steer.id : undefined;
 				nudges = 0;
-				const text = `[Message from the parent agent]\n${steer.message}\n\nWhen you are done, call herdr_squad_report again with your complete, updated result.`;
+				const marker = `[Message from the parent agent${deliveredSteerId ? `: ${deliveredSteerId}` : ""}]`;
+				if (deliveredSteerId) {
+					steeringMarkers.set(marker, deliveredSteerId);
+					pi.appendEntry(STEER_ENTRY_TYPE, { id: deliveredSteerId, marker });
+				}
+				const text = `${marker}\n${steer.message}\n\nWhen you are done, call herdr_squad_report again with your complete, updated result.`;
 				if (sessionCtx.isIdle()) pi.sendUserMessage(text);
 				else pi.sendUserMessage(text, { deliverAs: "steer" });
+				// Acknowledge only after the message has been handed to Pi.
+				await rename(path, `${path}${STEER_DELIVERED_SUFFIX}`);
 			}
 		} catch {
 			// Retried on the next tick.
@@ -177,7 +206,20 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 		}
 	}
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
+		// Restore steering revisions on /reload or resume as well as in the parent.
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== STEER_ENTRY_TYPE) continue;
+			const data = entry.data as { id?: unknown; marker?: unknown } | undefined;
+			if (typeof data?.id !== "string" || typeof data.marker !== "string") continue;
+			deliveredSteerId = data.id;
+			steeringMarkers.set(data.marker, data.id);
+		}
+		const report = await readSquadReport(join(runDir, reportFileName(agentId)));
+		if (report?.squadId === squadId && report.agentId === agentId) {
+			steerId = report.steerId;
+			reported = steerId === deliveredSteerId;
+		}
 		sessionCtx = ctx;
 		if (steerTimer) return;
 		steerTimer = setInterval(() => void deliverSteerMessages(), STEER_POLL_MS);
@@ -219,7 +261,10 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 		promptSnippet: "Submit the final structured report for this Herdr squad assignment",
 		promptGuidelines: ["Call herdr_squad_report exactly once as the final action after completing the assigned work."],
 		parameters: ReportParams,
+		executionMode: "sequential",
 		async execute(_toolCallId, params) {
+			const reportSteerId = steerId;
+			if (!params.findings.trim()) throw new Error("findings must not be empty");
 			const { agent, kind, checkoutRoot } = await validate();
 			const changedFiles =
 				kind === "worker" && checkoutRoot
@@ -236,6 +281,7 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 			}));
 			const report: SquadReport = {
 				version: 1,
+				...(reportSteerId ? { steerId: reportSteerId } : {}),
 				squadId,
 				agentId,
 				label: agent.label,
@@ -254,7 +300,7 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 				await writeFile(temporaryPath, `${JSON.stringify(report, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 				await rename(temporaryPath, reportPath);
 			});
-			reported = true;
+			reported = reportSteerId === deliveredSteerId;
 
 			return {
 				content: [{ type: "text", text: `Squad report submitted. ${kind === "worker" ? "Worker task" : "Investigation"} complete.` }],

@@ -1,6 +1,5 @@
 import { lstat, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { posix } from "node:path";
+import { dirname, isAbsolute, posix, relative, resolve, sep } from "node:path";
 
 function hasParentTraversal(value: string): boolean {
 	return value.split("/").includes("..");
@@ -44,9 +43,11 @@ async function canonicalTarget(checkoutRoot: string, target: string, requireRela
 
 	const lexicalTarget = resolve(canonicalCheckout, raw);
 	const lexicalRelative = relative(canonicalCheckout, lexicalTarget);
-	if (lexicalRelative === ".." || lexicalRelative.startsWith(`..${sep}`) || isAbsolute(lexicalRelative)) {
+	if (!isAbsolute(raw) && (lexicalRelative === ".." || lexicalRelative.startsWith(`..${sep}`) || isAbsolute(lexicalRelative))) {
 		throw new Error(`Target path is outside the checkout: ${target}`);
 	}
+	// Absolute paths may use an alias of the checkout (e.g. /tmp -> /private/tmp
+	// on macOS). Check canonical containment below, after resolving existing parents.
 	const lexicalRepositoryPath = (lexicalRelative || ".").split(sep).join("/");
 	if (hasGitMetadata(lexicalRepositoryPath)) throw new Error(`Git metadata is never writable: ${target}`);
 

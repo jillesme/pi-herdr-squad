@@ -1,6 +1,5 @@
 import { lstat, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { posix } from "node:path";
+import { dirname, isAbsolute, posix, relative, resolve, sep } from "node:path";
 
 function hasParentTraversal(value: string): boolean {
 	return value.split("/").includes("..");
@@ -44,9 +43,11 @@ async function canonicalTarget(checkoutRoot: string, target: string, requireRela
 
 	const lexicalTarget = resolve(canonicalCheckout, raw);
 	const lexicalRelative = relative(canonicalCheckout, lexicalTarget);
-	if (lexicalRelative === ".." || lexicalRelative.startsWith(`..${sep}`) || isAbsolute(lexicalRelative)) {
+	if (!isAbsolute(raw) && (lexicalRelative === ".." || lexicalRelative.startsWith(`..${sep}`) || isAbsolute(lexicalRelative))) {
 		throw new Error(`Target path is outside the checkout: ${target}`);
 	}
+	// Absolute paths may use an alias of the checkout (e.g. /tmp -> /private/tmp
+	// on macOS). Check canonical containment below, after resolving existing parents.
 	const lexicalRepositoryPath = (lexicalRelative || ".").split(sep).join("/");
 	if (hasGitMetadata(lexicalRepositoryPath)) throw new Error(`Git metadata is never writable: ${target}`);
 
@@ -79,6 +80,20 @@ async function canonicalTarget(checkoutRoot: string, target: string, requireRela
 	return { absolutePath: canonical, repositoryPath };
 }
 
+/**
+ * Convert an absolute path inside the checkout to a repository-relative path.
+ * Relative paths are returned unchanged so callers keep their declared spelling.
+ */
+export async function toRepositoryRelative(checkoutRoot: string, value: string): Promise<string> {
+	const raw = value.trim().replaceAll("\\", "/");
+	if (!raw.startsWith("/") && !isWindowsAbsolute(raw)) return value;
+	try {
+		return (await canonicalTarget(checkoutRoot, raw, false)).repositoryPath;
+	} catch {
+		throw new Error(`Path ${value} is outside the checkout ${checkoutRoot}; use a repository-relative path inside the checkout`);
+	}
+}
+
 export async function canonicalizeWritableRoot(checkoutRoot: string, root: string): Promise<string> {
 	return (await canonicalTarget(checkoutRoot, normalizeRepositoryPath(root), true)).repositoryPath;
 }
@@ -87,11 +102,17 @@ export async function validateExclusiveWritableRoots(
 	checkoutRoot: string,
 	assignments: Array<{ label: string; writableRoots: string[] }>,
 ): Promise<Array<{ label: string; writableRoots: string[]; canonicalWritableRoots: string[] }>> {
-	const normalized = assignments.map((assignment) => {
+	const relativeAssignments = await Promise.all(
+		assignments.map(async (assignment) => ({
+			label: assignment.label,
+			writableRoots: await Promise.all(assignment.writableRoots.map((root) => toRepositoryRelative(checkoutRoot, root))),
+		})),
+	);
+	const normalized = relativeAssignments.map((assignment) => {
 		const roots = assignment.writableRoots.map((root) => normalizeRepositoryPath(root));
 		if (roots.length === 0) throw new Error(`${assignment.label} requires at least one writable root`);
 		if (new Set(roots).size !== roots.length) throw new Error(`${assignment.label} has duplicate writable roots`);
-		if (roots.includes(".") && (assignments.length !== 1 || roots.length !== 1)) {
+		if (roots.includes(".") && (relativeAssignments.length !== 1 || roots.length !== 1)) {
 			throw new Error("writableRoots may contain '.' only when one worker owns the full checkout");
 		}
 		return { label: assignment.label, writableRoots: roots };

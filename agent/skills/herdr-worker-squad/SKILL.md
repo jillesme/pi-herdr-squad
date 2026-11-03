@@ -11,7 +11,8 @@ Use this workflow only when the user explicitly requests visible parallel coding
 
 - Worker squads require `HERDR_ENV=1`.
 - All workers use the same checkout and can see changes as they occur.
-- Workers receive `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and `herdr_squad_report`.
+- Workers receive `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `herdr_squad_report`, and the parent's web tools (`web_search`, `fetch_content`) when available. Pass `webTools: false` to withhold web tools.
+- Workers load skills and context files, so domain skills (for example Remotion or Cloudflare skills) apply to their work.
 - The extension enforces `writableRoots` for `edit` and `write` calls. Bash is a cooperative policy boundary, not a sandbox. Use worker squads only for trusted local coding work.
 - One squad supports 1-12 workers in no more than three tabs, with no more than four panes per tab.
 
@@ -36,7 +37,7 @@ Every assignment needs one or more exact repository-relative `writableRoots`:
 
 - A root identifies one file or one directory tree. It is not a shell glob.
 - Roots for different workers must not be equal, nested, or otherwise overlap.
-- Do not use absolute paths, `..`, empty paths, duplicates, or `.git` paths.
+- Prefer repository-relative paths. Absolute paths inside the checkout are converted automatically. Do not use paths outside the checkout, `..`, empty paths, duplicates, or `.git` paths.
 - Use `.` only when one worker owns the full checkout.
 - A worker can read outside its roots but must report a handoff instead of writing there.
 
@@ -44,7 +45,9 @@ Before launch, present the title, count, model choice, each label and functional
 
 ## Model selection
 
-Pass an exact user-requested model in `herdr_worker_squad_start.model`. Ask when a model identifier is ambiguous. Otherwise omit it so shared squad configuration and Pi's default apply. One model applies to all workers.
+Pass an exact user-requested model in `herdr_worker_squad_start.model`. Ask when a model identifier is ambiguous. Otherwise omit it so shared squad configuration and Pi's default apply. The squad model applies to every worker; set `model` on individual assignments to mix models (for example a cheaper model for mechanical edits, a stronger one for tricky logic). Only use model identifiers the user asked for or that appear in their configuration.
+
+Pass `inheritContext: true` when workers need decisions or constraints from earlier in the conversation that would be long to restate. Leave it off for self-contained assignments; it adds the same tokens to every worker.
 
 ## Mandatory sequence and coordinator mode
 
@@ -53,11 +56,13 @@ Calls must occur in separate tool rounds:
 1. Call `herdr_worker_squad_start` alone with the full parent `task`, exact `count`, and exactly `count` assignments.
 2. Retain the returned `squadId`.
 3. While workers run, stay in coordinator mode. Do not modify any worker-owned file.
-4. Call `herdr_squad_wait` alone.
-5. Call `herdr_squad_collect` alone, including after timeout, failure, or blocker results.
+4. Either call `herdr_squad_wait` alone with a generous timeout, or continue work outside every worker's writable roots and act on the automatic follow-up message the extension sends when the squad finishes or needs attention. Use `herdr_squad_status` for a non-blocking check. Never poll with short wait timeouts.
+5. Call `herdr_squad_collect` alone, including after timeout, failure, or blocker results. Agents listed as still running keep ownership of their roots; collect again after the next follow-up.
+   - To correct a worker, or ask it to fix a problem within its own writable roots, call `herdr_squad_steer`. A steered worker owns its roots again until it reports again. Use a later wave for work outside its roots.
 6. Inspect the final checkout diff. Worker reports are not proof that the checkout is correct.
 7. Run appropriate aggregate validation.
-8. If integration depends on first-wave results, plan and start a later worker squad with new exclusive ownership.
+8. When every report is structured, call `herdr_squad_close` to close the squad tabs. Leave the tabs open when reports are missing or blocked so the user can inspect them.
+9. If integration depends on first-wave results, plan and start a later worker squad with new exclusive ownership.
 
 Never coordinate workers directly or ask one worker to wait for another. The parent coordinates waves.
 

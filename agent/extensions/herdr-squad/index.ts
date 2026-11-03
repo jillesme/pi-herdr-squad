@@ -33,6 +33,7 @@ import {
 	type SquadManifest,
 	type SquadState,
 	type SquadTabState,
+	WEB_TOOL_NAMES,
 } from "./shared.ts";
 
 const MAX_TASK_LENGTH = 50_000;
@@ -40,8 +41,14 @@ const MAX_SCOPE_LENGTH = 8_000;
 const MAX_PROMPT_LENGTH = 16_000;
 const DEFAULT_WAIT_MS = 5 * 60_000;
 const MAX_WAIT_MS = 30 * 60_000;
-const BLOCKED_GRACE_MS = 1_500;
-const POLL_INTERVAL_MS = 500;
+const POLL_INTERVAL_MS = 2_000;
+const WATCH_INTERVAL_MS = 5_000;
+const BLOCKED_GRACE_MS = 3_000;
+// Children that reached idle/done without a report are treated as finished after this grace.
+const FINISHED_GRACE_MS = 4_000;
+// Before a child has been seen working, idle may just mean Pi is still starting up.
+const STARTUP_IDLE_GRACE_MS = 90_000;
+const NOTIFY_MESSAGE_TYPE = "herdr-squad-update";
 
 const AssignmentSchema = Type.Object({
 	label: Type.String({ description: "Short unique agent label", minLength: 1, maxLength: 80 }),
@@ -69,6 +76,11 @@ function startSchema(assignmentSchema: typeof AssignmentSchema | typeof WorkerAs
 			Type.String({ description: "Optional child model override, for example provider/model or model:thinking", minLength: 1, maxLength: 200 }),
 		),
 		focus: Type.Optional(Type.Boolean({ description: "Focus the first squad tab after launch; defaults to false" })),
+		webTools: Type.Optional(
+			Type.Boolean({
+				description: `Give children the parent's web tools (${WEB_TOOL_NAMES.join(", ")}) when available; defaults to true`,
+			}),
+		),
 	});
 }
 
@@ -78,6 +90,15 @@ const WorkerStartParams = startSchema(WorkerAssignmentSchema);
 const SquadIdParams = Type.Object({
 	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
 	timeoutMs: Type.Optional(Type.Integer({ description: "Overall wait timeout in milliseconds", minimum: 1_000, maximum: MAX_WAIT_MS })),
+});
+
+const StatusParams = Type.Object({
+	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+});
+
+const CloseParams = Type.Object({
+	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+	force: Type.Optional(Type.Boolean({ description: "Close tabs even when agents are still running; defaults to false" })),
 });
 
 const CollectParams = Type.Object({
@@ -102,7 +123,13 @@ interface StartInput {
 	title?: string;
 	model?: string;
 	focus?: boolean;
+	webTools?: boolean;
 }
+
+type SquadCheck =
+	| { kind: "complete"; completeCount: number }
+	| { kind: "pending"; completeCount: number; running: string[] }
+	| { kind: "problem"; completeCount: number; message: string; details: JsonObject };
 
 function cleanBody(value: string, maxLength: number): string {
 	return value.replace(/\u0000/g, "").trim().slice(0, maxLength);
@@ -121,6 +148,7 @@ function publicSquadDetails(state: SquadState) {
 		checkoutRoot: state.checkoutRoot,
 		model: state.model,
 		modelSource: state.modelSource,
+		webTools: state.webTools ?? [],
 		agents: state.agents.map((agent) => ({
 			paneId: agent.paneId,
 			tabId: agent.tabId,
@@ -181,7 +209,7 @@ function formatReport(report: Awaited<ReturnType<typeof readSquadReport>>, sourc
 						: "- No validation reported"
 				}`
 			: "";
-	return `# Squad Report: ${report.label}\n## Scope\n${report.scope}\n## Recommended next step\n${report.recommendedNextStep}\n## ${kind === "worker" ? "Completion summary" : "Findings"}\n${report.findings}\n## Evidence\n${formatList(report.evidence)}${workerSections}\n## Risks / Unknowns / Handoffs\n${formatList(report.risksOrUnknowns)}\n\nStructured report: ${sourcePath}`;
+	return `# Squad Report: ${report.label}\n## Scope\n${report.scope}\n## Recommended next step\n${report.recommendedNextStep || "None reported"}\n## ${kind === "worker" ? "Completion summary" : "Findings"}\n${report.findings}\n## Evidence\n${formatList(report.evidence)}${workerSections}\n## Risks / Unknowns / Handoffs\n${formatList(report.risksOrUnknowns)}\n\nStructured report: ${sourcePath}`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -234,7 +262,9 @@ export default function (pi: ExtensionAPI) {
 		const foundTabs = new Map<string, SquadTabState>();
 		const missingTabs: string[] = [];
 		for (const expected of state.tabs) {
-			const matches = listedTabs.filter((candidate) => candidate.label === expected.tabLabel && candidate.tab_id);
+			// Prefer the stable tab ID so a renamed squad tab is still found; fall back to the unique label.
+			const byId = listedTabs.find((candidate) => String(candidate.tab_id) === expected.tabId);
+			const matches = byId ? [byId] : listedTabs.filter((candidate) => candidate.label === expected.tabLabel && candidate.tab_id);
 			if (matches.length !== 1) {
 				missingTabs.push(expected.tabLabel);
 				continue;
@@ -280,6 +310,104 @@ export default function (pi: ExtensionAPI) {
 		return { allTabsFound: missingTabs.length === 0, missingTabs, missing };
 	}
 
+	// Per-agent Herdr status history, used to tell startup idle apart from a finished child.
+	const statusSince = new Map<string, { status: string; since: number }>();
+	const seenWorking = new Set<string>();
+
+	async function checkSquad(state: SquadState, signal?: AbortSignal): Promise<SquadCheck> {
+		const reports = await Promise.all(state.agents.map((agent) => readSquadReport(agent.reportPath)));
+		const completeCount = reports.filter(Boolean).length;
+		if (completeCount === state.agents.length) return { kind: "complete", completeCount };
+
+		const live = await refreshLivePanes(state, signal);
+		if (!live.allTabsFound || live.missing.length > 0) {
+			const problems: string[] = [];
+			if (live.missingTabs.length > 0) problems.push(`Missing tabs: ${live.missingTabs.join(", ")}`);
+			if (live.missing.length > 0) problems.push(`Missing panes: ${live.missing.join(", ")}`);
+			return { kind: "problem", completeCount, message: problems.join("; ") || "Squad tabs are no longer available", details: {} };
+		}
+
+		const now = Date.now();
+		const running: string[] = [];
+		for (let index = 0; index < state.agents.length; index++) {
+			if (reports[index]) continue;
+			const agent = state.agents[index];
+			const key = `${state.squadId}:${agent.agentId}`;
+			const status = agent.lastAgentStatus ?? "unknown";
+			const previous = statusSince.get(key);
+			const since = previous?.status === status ? previous.since : now;
+			statusSince.set(key, { status, since });
+			if (status === "working") seenWorking.add(key);
+
+			if (status === "blocked" && now - since >= BLOCKED_GRACE_MS) {
+				return { kind: "problem", completeCount, message: `${agent.label} is blocked in ${agent.tabLabel}`, details: { blocked: agent.label } };
+			}
+			const finished = status === "done" || status === "idle";
+			if (finished && now - since >= (seenWorking.has(key) ? FINISHED_GRACE_MS : STARTUP_IDLE_GRACE_MS)) {
+				return {
+					kind: "problem",
+					completeCount,
+					message: `${agent.label} (pane ${agent.paneId}, tab ${agent.tabLabel}) finished with Herdr status ${status} without submitting a report`,
+					details: { terminated: agent.label, terminalStatus: status },
+				};
+			}
+			running.push(agent.label);
+		}
+		return { kind: "pending", completeCount, running };
+	}
+
+	// Squads with an active herdr_squad_wait call; the background watcher skips them.
+	const waiting = new Set<string>();
+	const watchers = new Map<string, ReturnType<typeof setInterval>>();
+
+	function stopWatching(squadId: string): void {
+		const timer = watchers.get(squadId);
+		if (timer) clearInterval(timer);
+		watchers.delete(squadId);
+	}
+
+	// Notify the parent with a follow-up message when a running squad finishes or needs attention,
+	// so it can keep working instead of polling herdr_squad_wait.
+	function watchSquad(squadId: string): void {
+		if (watchers.has(squadId)) return;
+		let busy = false;
+		const timer = setInterval(async () => {
+			const state = squads.get(squadId);
+			if (!state || state.status !== "running") {
+				stopWatching(squadId);
+				return;
+			}
+			if (busy || waiting.has(squadId)) return;
+			busy = true;
+			try {
+				const check = await checkSquad(state);
+				if (check.kind === "pending" || state.status !== "running" || waiting.has(squadId)) return;
+				stopWatching(squadId);
+				let text: string;
+				if (check.kind === "complete") {
+					state.status = "completed";
+					delete state.failure;
+					text = `Herdr squad "${state.title}" finished: all ${check.completeCount} reports are ready. Call herdr_squad_collect with squadId ${state.squadId}.`;
+				} else {
+					state.status = "partial";
+					state.failure = check.message;
+					text = `Herdr squad "${state.title}" needs attention: ${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Call herdr_squad_collect with squadId ${state.squadId} to see reports and terminal output.`;
+				}
+				saveState(state);
+				pi.sendMessage(
+					{ customType: NOTIFY_MESSAGE_TYPE, content: text, display: true, details: { squadId: state.squadId, status: state.status } },
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+			} catch {
+				// Transient Herdr errors are retried on the next tick.
+			} finally {
+				busy = false;
+			}
+		}, WATCH_INTERVAL_MS);
+		timer.unref?.();
+		watchers.set(squadId, timer);
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		const snapshots = ctx.sessionManager
 			.getBranch()
@@ -288,6 +416,11 @@ export default function (pi: ExtensionAPI) {
 			.filter((state): state is SquadState => state !== undefined)
 			.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
 		for (const state of snapshots) squads.set(state.squadId, state);
+		for (const state of squads.values()) if (state.status === "running") watchSquad(state.squadId);
+	});
+
+	pi.on("session_shutdown", () => {
+		for (const squadId of [...watchers.keys()]) stopWatching(squadId);
 	});
 
 	async function launchSquad(kind: SquadKind, params: StartInput, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
@@ -342,6 +475,9 @@ export default function (pi: ExtensionAPI) {
 			model = configuredModel.model;
 			modelSource = configuredModel.source;
 		}
+		// Children load the same packages as the parent, so pass through web tools the parent has.
+		const availableTools = new Set(pi.getAllTools().map((tool) => tool.name));
+		const webTools = params.webTools === false ? [] : WEB_TOOL_NAMES.filter((name) => availableTools.has(name));
 
 		const squadId = randomUUID();
 		const shortId = squadId.replaceAll("-", "").slice(0, 6);
@@ -371,8 +507,8 @@ export default function (pi: ExtensionAPI) {
 			const promptPath = join(runDir, `prompt-${identity.agentId}.md`);
 			const prompt =
 				kind === "worker"
-					? buildWorkerPrompt(task, assignment.label, assignment.scope, assignment.writableRoots ?? [], assignment.prompt)
-					: buildInvestigationPrompt(task, assignment.label, assignment.scope, assignment.prompt);
+					? buildWorkerPrompt(task, assignment.label, assignment.scope, assignment.writableRoots ?? [], assignment.prompt, webTools)
+					: buildInvestigationPrompt(task, assignment.label, assignment.scope, assignment.prompt, webTools);
 			await writeFile(promptPath, prompt, { encoding: "utf8", mode: 0o600 });
 			agents.push({
 				agentId: identity.agentId,
@@ -404,6 +540,7 @@ export default function (pi: ExtensionAPI) {
 			title,
 			model,
 			modelSource,
+			webTools,
 			status: "launching",
 			agents,
 		};
@@ -463,26 +600,25 @@ export default function (pi: ExtensionAPI) {
 					`Squad ${agent.label}`,
 				];
 				if (state.model) commandArguments.push("--model", state.model);
-				commandArguments.push(
-					"--tools",
-					kind === "worker"
-						? "read,bash,edit,write,grep,find,ls,herdr_squad_report"
-						: "read,grep,find,ls,herdr_squad_report",
-					"--no-skills",
-					"--no-prompt-templates",
-					`@${agent.promptPath}`,
-				);
+				const tools = [
+					...(kind === "worker" ? ["read", "bash", "edit", "write", "grep", "find", "ls"] : ["read", "grep", "find", "ls"]),
+					...webTools,
+					"herdr_squad_report",
+				];
+				// Skills stay enabled so children can follow domain skills (for example Remotion or Cloudflare docs).
+				commandArguments.push("--tools", tools.join(","), "--no-prompt-templates", `@${agent.promptPath}`);
 				await runHerdr(["pane", "run", agent.paneId, commandArguments.map(shellQuote).join(" ")], signal);
 			}
 
 			state.status = "running";
 			if (params.focus === true && state.tabs[0]) await runHerdr(["tab", "focus", state.tabs[0].tabId], signal);
 			saveState(state);
+			watchSquad(state.squadId);
 			return {
 				content: [
 					{
-						type: "text",
-						text: `Started ${kind === "worker" ? "worker" : "read-only investigation"} Herdr squad ${squadId}.\nTabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ")}\nModel: ${state.model ?? "Pi default"} (${state.modelSource})\n${formatAgentList(state)}\n\nCall herdr_squad_wait with this squadId in the next tool round.`,
+						type: "text" as const,
+						text: `Started ${kind === "worker" ? "worker" : "read-only investigation"} Herdr squad ${squadId}.\nTabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ")}\nModel: ${state.model ?? "Pi default"} (${state.modelSource})\nWeb tools: ${webTools.join(", ") || "none"}\n${formatAgentList(state)}\n\nYou will receive an automatic follow-up message when the squad finishes or needs attention. Either call herdr_squad_wait with this squadId in the next tool round, or continue independent work and collect when notified. Do not poll with short waits.`,
 					},
 				],
 				details: publicSquadDetails(state),
@@ -499,7 +635,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [
 					{
-						type: "text",
+						type: "text" as const,
 						text: `Herdr squad ${state.squadId} launch was partial: ${message}\nCreated tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ")}\n${formatAgentList(state)}\nThe created tabs were left open for inspection. Use this squadId to wait for or collect any agents that did launch.`,
 					},
 				],
@@ -544,91 +680,96 @@ export default function (pi: ExtensionAPI) {
 		name: "herdr_squad_wait",
 		label: "Wait for Herdr Squad",
 		description:
-			"Wait for every child in a previously started investigation or worker squad to submit its structured report. Uses one overall timeout and reports blockers. Call alone after a squad start tool has returned.",
+			"Wait for every child in a previously started investigation or worker squad to submit its structured report. Uses one overall timeout and reports blockers. Call alone after a squad start tool has returned. Running squads also send an automatic follow-up when they finish, so never poll with short timeouts.",
 		promptSnippet: "Wait for a Herdr squad's structured reports",
 		promptGuidelines: [
 			"Call herdr_squad_wait only after a Herdr squad start tool has returned a squadId, and wait for its result before calling herdr_squad_collect.",
+			"Do not poll herdr_squad_wait with short timeouts. To keep working while a squad runs, skip waiting and act on the automatic squad follow-up message; use herdr_squad_status for a quick non-blocking check.",
 		],
 		parameters: SquadIdParams,
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const state = getSquad(params.squadId);
 			const timeoutMs = params.timeoutMs ?? DEFAULT_WAIT_MS;
 			const deadline = Date.now() + timeoutMs;
-			const blockedSince = new Map<string, number>();
 
-			while (true) {
-				if (signal?.aborted) throw new Error("Herdr squad wait cancelled");
-				const reports = await Promise.all(state.agents.map((agent) => readSquadReport(agent.reportPath)));
-				const completeCount = reports.filter(Boolean).length;
-				if (completeCount === state.agents.length) {
-					state.status = "completed";
-					delete state.failure;
-					saveState(state);
-					return {
-						content: [{ type: "text", text: `All ${completeCount} Herdr squad reports are ready. Call herdr_squad_collect with squadId ${state.squadId} in the next tool round.` }],
-						details: { ...publicSquadDetails(state), completeCount, timedOut: false },
-					};
-				}
-
-				const live = await refreshLivePanes(state, signal);
-				if (!live.allTabsFound || live.missing.length > 0) {
-					state.status = "partial";
-					const problems: string[] = [];
-					if (live.missingTabs.length > 0) problems.push(`Missing tabs: ${live.missingTabs.join(", ")}`);
-					if (live.missing.length > 0) problems.push(`Missing panes: ${live.missing.join(", ")}`);
-					state.failure = problems.join("; ") || "Squad tabs are no longer available";
-					saveState(state);
-					return {
-						content: [{ type: "text", text: `${completeCount}/${state.agents.length} reports are ready. ${state.failure}. Collect the available reports now.` }],
-						details: { ...publicSquadDetails(state), completeCount, timedOut: false },
-					};
-				}
-
-				const now = Date.now();
-				for (let index = 0; index < state.agents.length; index++) {
-					if (reports[index]) continue;
-					const agent = state.agents[index];
-					if (agent.lastAgentStatus === "done") {
-						state.status = "partial";
-						state.failure = `${agent.label} (pane ${agent.paneId}, tab ${agent.tabLabel}) terminated with Herdr status done without submitting a report`;
+			waiting.add(state.squadId);
+			try {
+				while (true) {
+					if (signal?.aborted) throw new Error("Herdr squad wait cancelled");
+					const check = await checkSquad(state, signal);
+					if (check.kind === "complete") {
+						state.status = "completed";
+						delete state.failure;
 						saveState(state);
 						return {
-							content: [{ type: "text", text: `${completeCount}/${state.agents.length} reports are ready. ${state.failure}. Collect available reports and terminal output now.` }],
-							details: { ...publicSquadDetails(state), completeCount, terminated: agent.label, terminalStatus: "done", timedOut: false },
+							content: [{ type: "text", text: `All ${check.completeCount} Herdr squad reports are ready. Call herdr_squad_collect with squadId ${state.squadId} in the next tool round.` }],
+							details: { ...publicSquadDetails(state), completeCount: check.completeCount, timedOut: false },
 						};
 					}
-					if (agent.lastAgentStatus === "blocked") {
-						const since = blockedSince.get(agent.agentId) ?? now;
-						blockedSince.set(agent.agentId, since);
-						if (now - since >= BLOCKED_GRACE_MS) {
-							state.status = "partial";
-							state.failure = `${agent.label} is blocked in ${agent.tabLabel}`;
-							saveState(state);
-							return {
-								content: [{ type: "text", text: `${completeCount}/${state.agents.length} reports are ready. ${state.failure}; collect available output and report the blocker.` }],
-								details: { ...publicSquadDetails(state), completeCount, blocked: agent.label, timedOut: false },
-							};
-						}
-					} else {
-						blockedSince.delete(agent.agentId);
+					if (check.kind === "problem") {
+						state.status = "partial";
+						state.failure = check.message;
+						saveState(state);
+						return {
+							content: [
+								{ type: "text", text: `${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Collect available reports and terminal output now.` },
+							],
+							details: { ...publicSquadDetails(state), ...check.details, completeCount: check.completeCount, timedOut: false },
+						};
 					}
-				}
 
-				onUpdate?.({
-					content: [{ type: "text", text: `Herdr squad: ${completeCount}/${state.agents.length} reports ready...` }],
-					details: { squadId: state.squadId, completeCount },
-				});
-				if (Date.now() >= deadline) {
-					state.status = "partial";
-					state.failure = `Timed out after ${timeoutMs}ms`;
-					saveState(state);
-					return {
-						content: [{ type: "text", text: `${completeCount}/${state.agents.length} reports were ready before the overall timeout. Collect available reports and terminal fallbacks now.` }],
-						details: { ...publicSquadDetails(state), completeCount, timedOut: true },
-					};
+					onUpdate?.({
+						content: [{ type: "text", text: `Herdr squad: ${check.completeCount}/${state.agents.length} reports ready...` }],
+						details: { squadId: state.squadId, completeCount: check.completeCount },
+					});
+					if (Date.now() >= deadline) {
+						// Agents keep running after a timeout; the watcher notifies the parent when they finish.
+						if (state.status === "running") watchSquad(state.squadId);
+						return {
+							content: [
+								{
+									type: "text",
+									text: `${check.completeCount}/${state.agents.length} reports were ready after ${Math.round(timeoutMs / 1000)}s. Still running: ${check.running.join(", ")}. The agents keep working and you will receive an automatic follow-up when the squad finishes. Continue independent work or call herdr_squad_wait again; collect now only if you need partial results.`,
+								},
+							],
+							details: { ...publicSquadDetails(state), completeCount: check.completeCount, running: check.running, timedOut: true },
+						};
+					}
+					await delay(Math.min(POLL_INTERVAL_MS, deadline - Date.now()), signal);
 				}
-				await delay(Math.min(POLL_INTERVAL_MS, deadline - Date.now()), signal);
+			} finally {
+				waiting.delete(state.squadId);
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "herdr_squad_status",
+		label: "Herdr Squad Status",
+		description:
+			"Non-blocking progress check for an investigation or worker squad: which agents have reported and each agent's Herdr status. Does not collect reports.",
+		promptSnippet: "Check a Herdr squad's progress without waiting",
+		promptGuidelines: ["Use herdr_squad_status for a quick progress check instead of herdr_squad_wait with a short timeout."],
+		parameters: StatusParams,
+		async execute(_toolCallId, params, signal) {
+			const state = getSquad(params.squadId);
+			const reports = await Promise.all(state.agents.map((agent) => readSquadReport(agent.reportPath)));
+			const live = await refreshLivePanes(state, signal);
+			const missing = new Set(live.missing);
+			const completeCount = reports.filter(Boolean).length;
+			const lines = state.agents.map((agent, index) => {
+				const progress = reports[index] ? "report ready" : missing.has(agent.label) ? "pane missing" : `Herdr status ${agent.lastAgentStatus ?? "unknown"}`;
+				return `- ${agent.label}: ${progress} (tab ${agent.tabLabel})`;
+			});
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Herdr squad "${state.title}" (${state.squadId}): ${state.status}, ${completeCount}/${state.agents.length} reports ready.${state.failure ? ` Failure: ${state.failure}.` : ""}\n${lines.join("\n")}`,
+					},
+				],
+				details: { ...publicSquadDetails(state), completeCount },
+			};
 		},
 	});
 
@@ -648,6 +789,7 @@ export default function (pi: ExtensionAPI) {
 			const missingTabs = new Set(live.missingTabs);
 			const perAgentBytes = Math.max(8_000, Math.floor((DEFAULT_MAX_BYTES - 4_000) / state.agents.length));
 			const sections: string[] = [];
+			const stillRunning: string[] = [];
 			let structuredCount = 0;
 
 			for (const agent of state.agents) {
@@ -657,6 +799,9 @@ export default function (pi: ExtensionAPI) {
 					structuredCount++;
 					section = formatReport(report, agent.reportPath, state.kind, agent.writableRoots);
 				} else {
+					const paneLive = !missingTabs.has(agent.tabLabel) && !missingPanes.has(agent.label) && Boolean(agent.paneId);
+					const running = paneLive && (agent.lastAgentStatus === "working" || agent.lastAgentStatus === "blocked");
+					if (running) stillRunning.push(agent.label);
 					let transcript = missingTabs.has(agent.tabLabel)
 						? `Terminal output unavailable because tab ${agent.tabLabel} could not be revalidated.`
 						: missingPanes.has(agent.label)
@@ -666,7 +811,7 @@ export default function (pi: ExtensionAPI) {
 						try {
 							const result = await pi.exec(
 								"herdr",
-								["pane", "read", agent.paneId, "--source", "recent-unwrapped", "--lines", String(lines)],
+								["pane", "read", agent.paneId, "--source", "recent-unwrapped", "--lines", String(running ? Math.min(lines, 40) : lines)],
 								{ signal, timeout: 15_000 },
 							);
 							if (result.code === 0 && result.stdout.trim()) transcript = result.stdout.trim();
@@ -678,7 +823,10 @@ export default function (pi: ExtensionAPI) {
 					const transcriptPath = join(state.runDir, `terminal-${agent.agentId}.txt`);
 					await writeFile(transcriptPath, `${transcript}\n`, { encoding: "utf8", mode: 0o600 });
 					const ownership = state.kind === "worker" ? `\n## Writable roots\n${formatList(agent.writableRoots ?? [], "None")}` : "";
-					section = `# Squad Report Missing: ${agent.label}\n## Scope\n${agent.scope}${ownership}\n## Tab\n${agent.tabLabel}\n## Status\nNo valid structured report was submitted. Last Herdr status: ${agent.lastAgentStatus ?? "unknown"}.\n## Terminal tail\n${transcript}\n\nTerminal snapshot: ${transcriptPath}`;
+					const status = running
+						? `Still running (Herdr status ${agent.lastAgentStatus}); no report yet.${state.kind === "worker" ? " Do not modify its writable roots until it reports." : ""}`
+						: `No valid structured report was submitted. Last Herdr status: ${agent.lastAgentStatus ?? "unknown"}.`;
+					section = `# Squad Report ${running ? "Pending" : "Missing"}: ${agent.label}\n## Scope\n${agent.scope}${ownership}\n## Tab\n${agent.tabLabel}\n## Status\n${status}\n## Terminal tail\n${transcript}\n\nTerminal snapshot: ${transcriptPath}`;
 				}
 
 				const limited = truncateHead(section, { maxBytes: perAgentBytes, maxLines: DEFAULT_MAX_LINES });
@@ -689,7 +837,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const fullCollection = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Kind: ${state.kind}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})\n- Mode: ${state.kind === "worker" ? "shared-checkout coding workers" : "read-only investigation"}\n- Structured reports: ${structuredCount}/${state.agents.length}\n\n${sections.join("\n\n---\n\n")}`;
+			const fullCollection = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Kind: ${state.kind}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})\n- Mode: ${state.kind === "worker" ? "shared-checkout coding workers" : "read-only investigation"}\n- Structured reports: ${structuredCount}/${state.agents.length}${stillRunning.length > 0 ? `\n- Still running: ${stillRunning.join(", ")} (you will receive an automatic follow-up when they finish; collect again then)` : ""}\n\n${sections.join("\n\n---\n\n")}`;
 			const truncation = truncateHead(fullCollection, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
 			let output = truncation.content;
 			let fullOutputPath: string | undefined;
@@ -701,13 +849,65 @@ export default function (pi: ExtensionAPI) {
 				output += `\n\n[Collection truncated: showing ${truncation.outputLines}/${truncation.totalLines} lines and ${formatSize(truncation.outputBytes)}/${formatSize(truncation.totalBytes)}. Full collection: ${fullOutputPath}]`;
 			}
 
-			state.status = "collected";
+			// Keep watching a partially collected squad so the parent hears when the rest finish.
+			if (stillRunning.length === 0) state.status = "collected";
+			else if (state.status === "running") watchSquad(state.squadId);
 			if (structuredCount === state.agents.length) delete state.failure;
 			state.collectedAt = new Date().toISOString();
 			saveState(state);
 			return {
 				content: [{ type: "text", text: output }],
-				details: { ...publicSquadDetails(state), structuredCount, fullOutputPath },
+				details: { ...publicSquadDetails(state), structuredCount, stillRunning, fullOutputPath },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "herdr_squad_close",
+		label: "Close Herdr Squad",
+		description:
+			"Close a squad's Herdr tabs after its results are collected. Refuses while agents are still running unless force is true. Reports and terminal snapshots stay on disk.",
+		promptSnippet: "Close a finished Herdr squad's tabs",
+		promptGuidelines: ["Call herdr_squad_close after herdr_squad_collect when the squad's tabs are no longer needed for inspection."],
+		parameters: CloseParams,
+		async execute(_toolCallId, params, signal) {
+			const state = getSquad(params.squadId);
+			const reports = await Promise.all(state.agents.map((agent) => readSquadReport(agent.reportPath)));
+			const live = await refreshLivePanes(state, signal);
+			const missingPanes = new Set(live.missing);
+			const active = state.agents.filter(
+				(agent, index) =>
+					!reports[index] && !missingPanes.has(agent.label) && (agent.lastAgentStatus === "working" || agent.lastAgentStatus === "blocked"),
+			);
+			if (active.length > 0 && params.force !== true) {
+				throw new Error(`Agents are still running: ${active.map((agent) => agent.label).join(", ")}. Collect first, or pass force: true to close anyway.`);
+			}
+
+			const missingTabs = new Set(live.missingTabs);
+			const closed: string[] = [];
+			const failures: string[] = [];
+			for (const tab of state.tabs) {
+				if (missingTabs.has(tab.tabLabel)) continue;
+				try {
+					await runHerdr(["tab", "close", tab.tabId], signal);
+					closed.push(tab.tabLabel);
+				} catch (error) {
+					failures.push(`${tab.tabLabel}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}
+
+			stopWatching(state.squadId);
+			state.status = "closed";
+			saveState(state);
+			const failureText = failures.length > 0 ? `\nFailed to close:\n${formatList(failures)}` : "";
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Closed ${closed.length} Herdr squad tab(s)${closed.length > 0 ? `: ${closed.join(", ")}` : ""}.${failureText}\nReports remain in ${state.runDir}.`,
+					},
+				],
+				details: { ...publicSquadDetails(state), closed, failures },
 			};
 		},
 	});

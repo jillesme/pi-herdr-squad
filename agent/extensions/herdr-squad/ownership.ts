@@ -79,6 +79,20 @@ async function canonicalTarget(checkoutRoot: string, target: string, requireRela
 	return { absolutePath: canonical, repositoryPath };
 }
 
+/**
+ * Convert an absolute path inside the checkout to a repository-relative path.
+ * Relative paths are returned unchanged so callers keep their declared spelling.
+ */
+export async function toRepositoryRelative(checkoutRoot: string, value: string): Promise<string> {
+	const raw = value.trim().replaceAll("\\", "/");
+	if (!raw.startsWith("/") && !isWindowsAbsolute(raw)) return value;
+	try {
+		return (await canonicalTarget(checkoutRoot, raw, false)).repositoryPath;
+	} catch {
+		throw new Error(`Path ${value} is outside the checkout ${checkoutRoot}; use a repository-relative path inside the checkout`);
+	}
+}
+
 export async function canonicalizeWritableRoot(checkoutRoot: string, root: string): Promise<string> {
 	return (await canonicalTarget(checkoutRoot, normalizeRepositoryPath(root), true)).repositoryPath;
 }
@@ -87,11 +101,17 @@ export async function validateExclusiveWritableRoots(
 	checkoutRoot: string,
 	assignments: Array<{ label: string; writableRoots: string[] }>,
 ): Promise<Array<{ label: string; writableRoots: string[]; canonicalWritableRoots: string[] }>> {
-	const normalized = assignments.map((assignment) => {
+	const relativeAssignments = await Promise.all(
+		assignments.map(async (assignment) => ({
+			label: assignment.label,
+			writableRoots: await Promise.all(assignment.writableRoots.map((root) => toRepositoryRelative(checkoutRoot, root))),
+		})),
+	);
+	const normalized = relativeAssignments.map((assignment) => {
 		const roots = assignment.writableRoots.map((root) => normalizeRepositoryPath(root));
 		if (roots.length === 0) throw new Error(`${assignment.label} requires at least one writable root`);
 		if (new Set(roots).size !== roots.length) throw new Error(`${assignment.label} has duplicate writable roots`);
-		if (roots.includes(".") && (assignments.length !== 1 || roots.length !== 1)) {
+		if (roots.includes(".") && (relativeAssignments.length !== 1 || roots.length !== 1)) {
 			throw new Error("writableRoots may contain '.' only when one worker owns the full checkout");
 		}
 		return { label: assignment.label, writableRoots: roots };

@@ -5,7 +5,7 @@ import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { assertWorkerWriteAllowed, canonicalizeWritableRoot, normalizeRepositoryPath } from "./ownership.ts";
+import { assertWorkerWriteAllowed, canonicalizeWritableRoot, normalizeRepositoryPath, toRepositoryRelative } from "./ownership.ts";
 import {
 	MANIFEST_FILE,
 	RUN_DIR_PREFIX,
@@ -15,8 +15,11 @@ import {
 	type SquadReport,
 } from "./shared.ts";
 
+const MAX_FINDINGS_LENGTH = 20_000;
+const MAX_NUDGES = 2;
+
 const ChangedFileParams = Type.Object({
-	path: Type.String({ description: "Repository-relative path of a file created or modified by this worker", minLength: 1, maxLength: 1000 }),
+	path: Type.String({ description: "Path of a file created or modified by this worker, repository-relative or absolute inside the checkout", minLength: 1, maxLength: 1000 }),
 	summary: Type.String({ description: "Concise summary of the change", minLength: 1, maxLength: 1000 }),
 });
 
@@ -27,24 +30,31 @@ const ValidationParams = Type.Object({
 
 const ReportParams = Type.Object({
 	findings: Type.String({
-		description: "Concise findings or implementation summary for the assigned scope",
+		description: "Findings or implementation summary for the assigned scope. Markdown is fine; prioritize the most important points.",
 		minLength: 1,
-		maxLength: 6000,
+		maxLength: MAX_FINDINGS_LENGTH,
 	}),
-	evidence: Type.Array(Type.String({ maxLength: 500 }), {
-		description: "Concrete file paths, symbols, configuration keys, or other evidence",
-		maxItems: 20,
-	}),
-	risksOrUnknowns: Type.Array(Type.String({ maxLength: 500 }), {
-		description: "Unverified assumptions, risks, handoffs, or intentionally unchanged files",
-		maxItems: 12,
-	}),
-	recommendedNextStep: Type.String({
-		description: "One actionable next step for the parent agent",
-		minLength: 1,
-		maxLength: 2000,
-	}),
-	changedFiles: Type.Optional(Type.Array(ChangedFileParams, { description: "Files created or modified by a worker", maxItems: 100 })),
+	evidence: Type.Optional(
+		Type.Array(Type.String({ maxLength: 1000 }), {
+			description: "Concrete file paths, symbols, URLs, configuration keys, or other evidence. Defaults to an empty list.",
+			maxItems: 50,
+		}),
+	),
+	risksOrUnknowns: Type.Optional(
+		Type.Array(Type.String({ maxLength: 1000 }), {
+			description: "Unverified assumptions, risks, handoffs, or intentionally unchanged files. Defaults to an empty list.",
+			maxItems: 30,
+		}),
+	),
+	recommendedNextStep: Type.Optional(
+		Type.String({
+			description: "One actionable next step for the parent agent",
+			maxLength: 2000,
+		}),
+	),
+	changedFiles: Type.Optional(
+		Type.Array(ChangedFileParams, { description: "Files created or modified by a worker (repository-relative or absolute inside the checkout)", maxItems: 200 }),
+	),
 	validation: Type.Optional(Type.Array(ValidationParams, { description: "Validation commands and their results", maxItems: 30 })),
 });
 
@@ -103,6 +113,28 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 	let validation: Promise<ValidatedChild> | undefined;
 	const validate = () => (validation ??= loadValidatedManifest(runDir, squadId, agentId, token));
 
+	// A child that ends its run without a report looks finished to the parent but returns nothing.
+	// Continue the same run with a reminder so Herdr keeps showing it as working.
+	let reported = false;
+	let nudges = 0;
+	pi.on("agent_before_settle", (event) => {
+		if (reported || event.outcome === "aborted" || nudges >= MAX_NUDGES) return undefined;
+		nudges++;
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message",
+					customType: "herdr-squad-report-reminder",
+					content:
+						"You ended without calling herdr_squad_report, so the parent agent received nothing. Call herdr_squad_report now with your complete result. If you could not finish, report what you did, what is missing, and why. Only findings is required.",
+					display: true,
+				},
+			],
+			continue: true,
+		};
+	});
+
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
 		const child = await validate();
@@ -133,11 +165,16 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 		promptGuidelines: ["Call herdr_squad_report exactly once as the final action after completing the assigned work."],
 		parameters: ReportParams,
 		async execute(_toolCallId, params) {
-			const { agent, kind } = await validate();
-			const changedFiles = params.changedFiles?.map((item) => ({
-				path: normalizeRepositoryPath(item.path, { allowDot: false }),
-				summary: item.summary.trim(),
-			}));
+			const { agent, kind, checkoutRoot } = await validate();
+			const changedFiles =
+				kind === "worker" && checkoutRoot
+					? await Promise.all(
+							(params.changedFiles ?? []).map(async (item) => ({
+								path: normalizeRepositoryPath(await toRepositoryRelative(checkoutRoot, item.path), { allowDot: false }),
+								summary: item.summary.trim(),
+							})),
+						)
+					: undefined;
 			const validationResults = params.validation?.map((item) => ({
 				command: item.command.trim(),
 				result: item.result.trim(),
@@ -150,9 +187,9 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 				scope: agent.scope,
 				createdAt: new Date().toISOString(),
 				findings: params.findings.trim(),
-				evidence: params.evidence.map((item) => item.trim()).filter(Boolean),
-				risksOrUnknowns: params.risksOrUnknowns.map((item) => item.trim()).filter(Boolean),
-				recommendedNextStep: params.recommendedNextStep.trim(),
+				evidence: (params.evidence ?? []).map((item) => item.trim()).filter(Boolean),
+				risksOrUnknowns: (params.risksOrUnknowns ?? []).map((item) => item.trim()).filter(Boolean),
+				recommendedNextStep: params.recommendedNextStep?.trim() ?? "",
 				...(kind === "worker" ? { changedFiles: changedFiles ?? [], validation: validationResults ?? [] } : {}),
 			};
 
@@ -162,6 +199,7 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 				await writeFile(temporaryPath, `${JSON.stringify(report, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 				await rename(temporaryPath, reportPath);
 			});
+			reported = true;
 
 			return {
 				content: [{ type: "text", text: `Squad report submitted. ${kind === "worker" ? "Worker task" : "Investigation"} complete.` }],

@@ -65,6 +65,6 @@ export async function resolveConfiguredModel(cwd: string, projectTrusted: boolea
 	return resolved;
 }
 
-export function validateExplicitModel(value: string): string {
-	return validateModel(value, "herdr_squad_start.model")!;
+export function validateExplicitModel(value: string, field = "herdr_squad_start.model"): string {
+	return validateModel(value, field)!;
 }

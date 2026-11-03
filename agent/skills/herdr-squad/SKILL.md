@@ -26,7 +26,7 @@ Before launch, present:
 
 - a short tab title;
 - the selected count;
-- an explicit requested model, if any, or the configured/default model;
+- an explicit requested model, if any, or the configured/default model, plus any per-assignment models;
 - each unique label and scope;
 - one sentence that explains why the responsibilities are different.
 
@@ -37,7 +37,7 @@ Each prompt must request concrete evidence and stay inside its scope. Verify tha
 - Pass an exact user-requested model string in `herdr_squad_start.model`.
 - Ask for Pi's exact model identifier if the name is ambiguous.
 - Otherwise omit `model`. The extension resolves project config, global config, then Pi's default.
-- One model applies to all children.
+- The squad model applies to every child. To mix models, set `model` on individual assignments: a cheaper/faster model for mechanical scopes (listing usages, reading docs), a stronger one for subtle analysis. Only use model identifiers the user asked for or that appear in their configuration.
 - Pass `inheritContext: true` when assignments depend on context discussed earlier in the conversation (decisions, constraints, prior findings) that would be long to restate. Leave it off for self-contained scopes; it adds the same tokens to every child.
 
 ## Tool sequence

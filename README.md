@@ -135,10 +135,11 @@ Herdr creates `Math.ceil(agentCount / 4)` tabs and retains them after completion
 
 Model precedence for both squad types is:
 
-1. An explicit `model` passed to the start tool.
-2. Trusted project config at `.pi/herdr-squad.json`.
-3. Global config at `~/.pi/agent/herdr-squad.json`.
-4. Pi's normal default.
+1. A `model` on an individual assignment (that agent only).
+2. An explicit `model` passed to the start tool.
+3. Trusted project config at `.pi/herdr-squad.json`.
+4. Global config at `~/.pi/agent/herdr-squad.json`.
+5. Pi's normal default.
 
 Configuration shape:
 
@@ -156,7 +157,7 @@ A trusted project can bypass the global model and use Pi's default:
 }
 ```
 
-Configuration is read each time a squad starts. Untrusted project configuration is ignored. The selected model applies to every child in one squad.
+Configuration is read each time a squad starts. Untrusted project configuration is ignored. The squad model applies to every child without an assignment `model`; mix models in one squad by setting `model` on individual assignments (for example a cheaper model for a mechanical scope and a stronger one for a subtle one).
 
 Use the exact identifier recognized by Pi, usually in `provider/model` form:
 

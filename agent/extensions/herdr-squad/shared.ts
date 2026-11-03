@@ -45,6 +45,8 @@ export interface SquadAgentState {
 	reportPath: string;
 	promptPath: string;
 	writableRoots?: string[];
+	/** Per-assignment model override; children without one use the squad model. */
+	model?: string;
 	lastAgentStatus?: string;
 }
 

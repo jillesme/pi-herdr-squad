@@ -65,6 +65,13 @@ const AssignmentSchema = Type.Object({
 	label: Type.String({ description: "Short unique agent label", minLength: 1, maxLength: 80 }),
 	scope: Type.String({ description: "Exclusive, non-overlapping investigation scope", minLength: 1, maxLength: MAX_SCOPE_LENGTH }),
 	prompt: Type.String({ description: "Specific read-only investigation instructions", minLength: 1, maxLength: MAX_PROMPT_LENGTH }),
+	model: Type.Optional(
+		Type.String({
+			description: "Optional model for this agent only, overriding the squad model (for example a cheaper model for a simple scope)",
+			minLength: 1,
+			maxLength: 200,
+		}),
+	),
 });
 
 const WorkerAssignmentSchema = Type.Object({
@@ -75,6 +82,13 @@ const WorkerAssignmentSchema = Type.Object({
 		maxItems: 100,
 	}),
 	prompt: Type.String({ description: "Specific implementation instructions", minLength: 1, maxLength: MAX_PROMPT_LENGTH }),
+	model: Type.Optional(
+		Type.String({
+			description: "Optional model for this agent only, overriding the squad model (for example a cheaper model for a simple scope)",
+			minLength: 1,
+			maxLength: 200,
+		}),
+	),
 });
 
 function startSchema(assignmentSchema: typeof AssignmentSchema | typeof WorkerAssignmentSchema) {
@@ -84,7 +98,11 @@ function startSchema(assignmentSchema: typeof AssignmentSchema | typeof WorkerAs
 		assignments: Type.Array(assignmentSchema, { minItems: 1, maxItems: MAX_AGENTS }),
 		title: Type.Optional(Type.String({ description: "Short tab title", maxLength: 80 })),
 		model: Type.Optional(
-			Type.String({ description: "Optional child model override, for example provider/model or model:thinking", minLength: 1, maxLength: 200 }),
+			Type.String({
+				description: "Optional model for every child, for example provider/model or model:thinking; an assignment model overrides it",
+				minLength: 1,
+				maxLength: 200,
+			}),
 		),
 		focus: Type.Optional(Type.Boolean({ description: "Focus the first squad tab after launch; defaults to false" })),
 		webTools: Type.Optional(
@@ -137,12 +155,13 @@ interface LaunchAssignment {
 	prompt: string;
 	writableRoots?: string[];
 	canonicalWritableRoots?: string[];
+	model?: string;
 }
 
 interface StartInput {
 	task: string;
 	count: number;
-	assignments: Array<{ label: string; scope: string; prompt: string; writableRoots?: string[] }>;
+	assignments: Array<{ label: string; scope: string; prompt: string; writableRoots?: string[]; model?: string }>;
 	title?: string;
 	model?: string;
 	focus?: boolean;
@@ -181,6 +200,7 @@ function publicSquadDetails(state: SquadState) {
 			label: agent.label,
 			scope: agent.scope,
 			writableRoots: agent.writableRoots,
+			model: agent.model ?? state.model,
 			status: agent.lastAgentStatus,
 		})),
 		failure: state.failure,
@@ -191,7 +211,8 @@ function formatAgentList(state: SquadState): string {
 	return state.agents
 		.map((agent) => {
 			const ownership = agent.writableRoots ? `; writable: ${agent.writableRoots.join(", ")}` : "";
-			return `- ${agent.label}: ${agent.scope} (tab ${agent.tabLabel}; pane ${agent.paneId || "not created"}${ownership})`;
+			const model = agent.model ? `; model: ${agent.model}` : "";
+			return `- ${agent.label}: ${agent.scope} (tab ${agent.tabLabel}; pane ${agent.paneId || "not created"}${model}${ownership})`;
 		})
 		.join("\n");
 }
@@ -461,6 +482,7 @@ export default function (pi: ExtensionAPI) {
 			label: normalizeDisplayText(assignment.label, 30),
 			scope: cleanBody(assignment.scope, MAX_SCOPE_LENGTH),
 			prompt: cleanBody(assignment.prompt, MAX_PROMPT_LENGTH),
+			...(assignment.model ? { model: validateExplicitModel(assignment.model, `assignments[${assignment.label}].model`) } : {}),
 			...(kind === "worker" ? { writableRoots: assignment.writableRoots ?? [] } : {}),
 		}));
 		if (normalizedAssignments.some((assignment) => !assignment.label || !assignment.scope || !assignment.prompt)) {
@@ -554,6 +576,7 @@ export default function (pi: ExtensionAPI) {
 				tabLabel: tabLabels[Math.floor(index / MAX_AGENTS_PER_TAB)],
 				reportPath: join(runDir, reportFileName(identity.agentId)),
 				promptPath,
+				...(assignment.model && assignment.model !== model ? { model: assignment.model } : {}),
 				...(kind === "worker" ? { writableRoots: assignment.writableRoots } : {}),
 			});
 		}
@@ -634,7 +657,8 @@ export default function (pi: ExtensionAPI) {
 					"--name",
 					`Squad ${agent.label}`,
 				];
-				if (state.model) commandArguments.push("--model", state.model);
+				const agentModel = agent.model ?? state.model;
+				if (agentModel) commandArguments.push("--model", agentModel);
 				const tools = [
 					...(kind === "worker" ? ["read", "bash", "edit", "write", "grep", "find", "ls"] : ["read", "grep", "find", "ls"]),
 					...webTools,
@@ -683,7 +707,7 @@ export default function (pi: ExtensionAPI) {
 		name: "herdr_squad_start",
 		label: "Start Herdr Investigation Squad",
 		description:
-			"Create and launch 1-12 visible, strictly read-only Pi investigation agents across up to three Herdr tabs. An explicit model overrides project/global config. Returns an opaque squadId. Call this tool alone; wait for its result before calling herdr_squad_wait.",
+			"Create and launch 1-12 visible, strictly read-only Pi investigation agents across up to three Herdr tabs. An explicit model overrides project/global config, and an assignment model overrides it for that agent. Returns an opaque squadId. Call this tool alone; wait for its result before calling herdr_squad_wait.",
 		promptSnippet: "Launch a visible read-only Herdr investigation squad",
 		promptGuidelines: [
 			"Call herdr_squad_start only after defining distinct non-overlapping scopes, and call it in a separate tool round before herdr_squad_wait.",
@@ -872,7 +896,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const fullCollection = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Kind: ${state.kind}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})\n- Mode: ${state.kind === "worker" ? "shared-checkout coding workers" : "read-only investigation"}\n- Structured reports: ${structuredCount}/${state.agents.length}${stillRunning.length > 0 ? `\n- Still running: ${stillRunning.join(", ")} (you will receive an automatic follow-up when they finish; collect again then)` : ""}\n\n${sections.join("\n\n---\n\n")}`;
+			const fullCollection = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Kind: ${state.kind}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})${state.agents.some((agent) => agent.model) ? `; overrides: ${state.agents.filter((agent) => agent.model).map((agent) => `${agent.label}=${agent.model}`).join(", ")}` : ""}\n- Mode: ${state.kind === "worker" ? "shared-checkout coding workers" : "read-only investigation"}\n- Structured reports: ${structuredCount}/${state.agents.length}${stillRunning.length > 0 ? `\n- Still running: ${stillRunning.join(", ")} (you will receive an automatic follow-up when they finish; collect again then)` : ""}\n\n${sections.join("\n\n---\n\n")}`;
 			const truncation = truncateHead(fullCollection, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
 			let output = truncation.content;
 			let fullOutputPath: string | undefined;

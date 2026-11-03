@@ -45,7 +45,7 @@ Before launch, present the title, count, model choice, each label and functional
 
 ## Model selection
 
-Pass an exact user-requested model in `herdr_worker_squad_start.model`. Ask when a model identifier is ambiguous. Otherwise omit it so shared squad configuration and Pi's default apply. One model applies to all workers.
+Pass an exact user-requested model in `herdr_worker_squad_start.model`. Ask when a model identifier is ambiguous. Otherwise omit it so shared squad configuration and Pi's default apply. The squad model applies to every worker; set `model` on individual assignments to mix models (for example a cheaper model for mechanical edits, a stronger one for tricky logic). Only use model identifiers the user asked for or that appear in their configuration.
 
 Pass `inheritContext: true` when workers need decisions or constraints from earlier in the conversation that would be long to restate. Leave it off for self-contained assignments; it adds the same tokens to every worker.
 

@@ -105,11 +105,20 @@ Worker squads are for trusted local coding work, not hostile isolation. After co
 | `herdr_squad_wait` | Block until every report is in, a child is blocked or finished without a report, or the timeout passes. A timeout does not stop the agents. |
 | `herdr_squad_status` | Non-blocking progress check: reports ready and each agent's Herdr status. |
 | `herdr_squad_collect` | Collect structured reports, with terminal tails for missing ones. Agents that are still running are listed as pending. |
+| `herdr_squad_steer` | Send a correction or follow-up message to one child. A child that already reported reports again. |
 | `herdr_squad_close` | Close a squad's tabs. Refuses while agents are running unless `force: true`. Reports stay on disk. |
 
 ## Completion notifications
 
 The parent does not need to block on `herdr_squad_wait`. While a squad runs, the extension checks it in the background and sends a follow-up message to the parent session when every report is ready, or when a child is blocked, finished without a report, or lost its pane. The parent can keep working on independent tasks and collect when notified. Partially collected squads stay watched until the remaining agents finish.
+
+## Steering
+
+`herdr_squad_steer` sends a message to one child by label. The parent writes it to the private run directory and the child's squad extension delivers it as a user message: while the child works, it arrives after the current tool calls; when the child is idle or has already reported, it starts a new turn. If the child already reported, that report is renamed to `report-<agent>.superseded-<time>.json` and the squad goes back to running, so the parent is notified again when the updated report arrives. You can also type into a child's pane directly.
+
+## Parent context
+
+Pass `inheritContext: true` to a start tool to include the parent's current conversation branch in every child prompt as background. It is serialized the same way compaction serializes messages (tool results are cut to 2,000 characters, thinking is omitted) and only the most recent ~40KB is kept. Children are told it is background, not instructions. It is off by default because it adds the same tokens to every child.
 
 ## Children
 

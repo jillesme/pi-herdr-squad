@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { lstat, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { assertWorkerWriteAllowed, canonicalizeWritableRoot, normalizeRepositoryPath, toRepositoryRelative } from "./ownership.ts";
@@ -10,13 +10,17 @@ import {
 	MANIFEST_FILE,
 	RUN_DIR_PREFIX,
 	reportFileName,
+	STEER_DELIVERED_SUFFIX,
+	steerFilePrefix,
 	type SquadKind,
 	type SquadManifest,
 	type SquadReport,
+	type SquadSteerMessage,
 } from "./shared.ts";
 
 const MAX_FINDINGS_LENGTH = 20_000;
 const MAX_NUDGES = 2;
+const STEER_POLL_MS = 1_000;
 
 const ChangedFileParams = Type.Object({
 	path: Type.String({ description: "Path of a file created or modified by this worker, repository-relative or absolute inside the checkout", minLength: 1, maxLength: 1000 }),
@@ -135,6 +139,57 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 		};
 	});
 
+	// Deliver parent steering messages dropped into the run directory by herdr_squad_steer.
+	let sessionCtx: ExtensionContext | undefined;
+	let steerTimer: ReturnType<typeof setInterval> | undefined;
+	let polling = false;
+	const steerDir = runDir;
+	const prefix = steerFilePrefix(agentId);
+
+	async function deliverSteerMessages(): Promise<void> {
+		if (polling || !sessionCtx) return;
+		polling = true;
+		try {
+			await validate();
+			const names = (await readdir(steerDir)).filter((name) => name.startsWith(prefix) && name.endsWith(".json")).sort();
+			for (const name of names) {
+				const path = join(steerDir, name);
+				let steer: Partial<SquadSteerMessage>;
+				try {
+					steer = JSON.parse(await readFile(path, "utf8"));
+				} catch {
+					continue;
+				}
+				// Mark delivered first so a slow turn never receives the same message twice.
+				await rename(path, `${path}${STEER_DELIVERED_SUFFIX}`);
+				if (steer.version !== 1 || steer.squadId !== squadId || steer.agentId !== agentId || typeof steer.message !== "string") continue;
+				// A steered child must report again, even if it already reported.
+				reported = false;
+				nudges = 0;
+				const text = `[Message from the parent agent]\n${steer.message}\n\nWhen you are done, call herdr_squad_report again with your complete, updated result.`;
+				if (sessionCtx.isIdle()) pi.sendUserMessage(text);
+				else pi.sendUserMessage(text, { deliverAs: "steer" });
+			}
+		} catch {
+			// Retried on the next tick.
+		} finally {
+			polling = false;
+		}
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		sessionCtx = ctx;
+		if (steerTimer) return;
+		steerTimer = setInterval(() => void deliverSteerMessages(), STEER_POLL_MS);
+		steerTimer.unref?.();
+	});
+
+	pi.on("session_shutdown", () => {
+		if (steerTimer) clearInterval(steerTimer);
+		steerTimer = undefined;
+		sessionCtx = undefined;
+	});
+
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
 		const child = await validate();
@@ -160,7 +215,7 @@ export function registerChildReportTool(pi: ExtensionAPI): boolean {
 		name: "herdr_squad_report",
 		label: "Submit Squad Report",
 		description:
-			"Submit the final structured report for this Herdr squad assignment. Worker reports can include changed files and validation. Call exactly once as the final action.",
+			"Submit the final structured report for this Herdr squad assignment. Worker reports can include changed files and validation. Call exactly once as the final action; after a parent follow-up message, call it again with the updated result.",
 		promptSnippet: "Submit the final structured report for this Herdr squad assignment",
 		promptGuidelines: ["Call herdr_squad_report exactly once as the final action after completing the assigned work."],
 		parameters: ReportParams,

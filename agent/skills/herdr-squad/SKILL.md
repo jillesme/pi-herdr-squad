@@ -38,6 +38,7 @@ Each prompt must request concrete evidence and stay inside its scope. Verify tha
 - Ask for Pi's exact model identifier if the name is ambiguous.
 - Otherwise omit `model`. The extension resolves project config, global config, then Pi's default.
 - One model applies to all children.
+- Pass `inheritContext: true` when assignments depend on context discussed earlier in the conversation (decisions, constraints, prior findings) that would be long to restate. Leave it off for self-contained scopes; it adds the same tokens to every child.
 
 ## Tool sequence
 
@@ -49,6 +50,7 @@ Calls must occur in separate tool rounds:
    - **Background mode** (independent work remains): keep working. The extension sends an automatic follow-up message when the squad finishes or needs attention. Use `herdr_squad_status` for a non-blocking progress check.
    - Never poll with short `herdr_squad_wait` timeouts, and never collect early just to check progress.
 3. Call `herdr_squad_collect` alone after the wait returns or the follow-up arrives, including after partial results. If collection lists agents as still running, you will be notified again; collect again then.
+   - To redirect a running child, or ask a finished child a follow-up within its scope, call `herdr_squad_steer` instead of starting a new squad. A steered child reports again; collect after the next follow-up.
 4. Synthesize only after collection returns.
 5. When every report is structured, call `herdr_squad_close` to close the squad tabs. Leave the tabs open when reports are missing, blocked, or malformed so the user can inspect them.
 

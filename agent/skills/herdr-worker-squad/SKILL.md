@@ -47,6 +47,8 @@ Before launch, present the title, count, model choice, each label and functional
 
 Pass an exact user-requested model in `herdr_worker_squad_start.model`. Ask when a model identifier is ambiguous. Otherwise omit it so shared squad configuration and Pi's default apply. One model applies to all workers.
 
+Pass `inheritContext: true` when workers need decisions or constraints from earlier in the conversation that would be long to restate. Leave it off for self-contained assignments; it adds the same tokens to every worker.
+
 ## Mandatory sequence and coordinator mode
 
 Calls must occur in separate tool rounds:
@@ -56,6 +58,7 @@ Calls must occur in separate tool rounds:
 3. While workers run, stay in coordinator mode. Do not modify any worker-owned file.
 4. Either call `herdr_squad_wait` alone with a generous timeout, or continue work outside every worker's writable roots and act on the automatic follow-up message the extension sends when the squad finishes or needs attention. Use `herdr_squad_status` for a non-blocking check. Never poll with short wait timeouts.
 5. Call `herdr_squad_collect` alone, including after timeout, failure, or blocker results. Agents listed as still running keep ownership of their roots; collect again after the next follow-up.
+   - To correct a worker, or ask it to fix a problem within its own writable roots, call `herdr_squad_steer`. A steered worker owns its roots again until it reports again. Use a later wave for work outside its roots.
 6. Inspect the final checkout diff. Worker reports are not proof that the checkout is correct.
 7. Run appropriate aggregate validation.
 8. When every report is structured, call `herdr_squad_close` to close the squad tabs. Leave the tabs open when reports are missing or blocked so the user can inspect them.

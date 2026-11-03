@@ -1,13 +1,17 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	buildSessionContext,
+	convertToLlm,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	formatSize,
+	serializeConversation,
 	truncateHead,
+	truncateTail,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -28,6 +32,9 @@ import {
 	shellQuote,
 	SQUAD_ENTRY_TYPE,
 	STATE_VERSION,
+	STEER_DELIVERED_SUFFIX,
+	steerFilePrefix,
+	type SquadSteerMessage,
 	type SquadAgentState,
 	type SquadKind,
 	type SquadManifest,
@@ -49,6 +56,10 @@ const FINISHED_GRACE_MS = 4_000;
 // Before a child has been seen working, idle may just mean Pi is still starting up.
 const STARTUP_IDLE_GRACE_MS = 90_000;
 const NOTIFY_MESSAGE_TYPE = "herdr-squad-update";
+// Tail of the parent conversation inlined into each child prompt when inheritContext is set.
+const MAX_PARENT_CONTEXT_BYTES = 40_000;
+const MAX_STEER_LENGTH = 8_000;
+const STEER_ACK_WAIT_MS = 5_000;
 
 const AssignmentSchema = Type.Object({
 	label: Type.String({ description: "Short unique agent label", minLength: 1, maxLength: 80 }),
@@ -81,6 +92,12 @@ function startSchema(assignmentSchema: typeof AssignmentSchema | typeof WorkerAs
 				description: `Give children the parent's web tools (${WEB_TOOL_NAMES.join(", ")}) when available; defaults to true`,
 			}),
 		),
+		inheritContext: Type.Optional(
+			Type.Boolean({
+				description:
+					"Include the recent parent conversation (serialized, most recent ~40KB) in every child prompt as background, so prompts need not restate discussed context; defaults to false",
+			}),
+		),
 	});
 }
 
@@ -94,6 +111,12 @@ const SquadIdParams = Type.Object({
 
 const StatusParams = Type.Object({
 	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+});
+
+const SteerParams = Type.Object({
+	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+	agent: Type.String({ description: "Assignment label (or agent ID) of the child to message", minLength: 1, maxLength: 80 }),
+	message: Type.String({ description: "Message for the child: a correction, extra context, or a follow-up request", minLength: 1, maxLength: MAX_STEER_LENGTH }),
 });
 
 const CloseParams = Type.Object({
@@ -124,6 +147,7 @@ interface StartInput {
 	model?: string;
 	focus?: boolean;
 	webTools?: boolean;
+	inheritContext?: boolean;
 }
 
 type SquadCheck =
@@ -149,6 +173,7 @@ function publicSquadDetails(state: SquadState) {
 		model: state.model,
 		modelSource: state.modelSource,
 		webTools: state.webTools ?? [],
+		inheritedContext: state.inheritedContext ?? false,
 		agents: state.agents.map((agent) => ({
 			paneId: agent.paneId,
 			tabId: agent.tabId,
@@ -478,6 +503,15 @@ export default function (pi: ExtensionAPI) {
 		// Children load the same packages as the parent, so pass through web tools the parent has.
 		const availableTools = new Set(pi.getAllTools().map((tool) => tool.name));
 		const webTools = params.webTools === false ? [] : WEB_TOOL_NAMES.filter((name) => availableTools.has(name));
+		let parentContext: string | undefined;
+		if (params.inheritContext === true) {
+			const { messages } = buildSessionContext(ctx.sessionManager.getBranch(), ctx.sessionManager.getLeafId());
+			const serialized = serializeConversation(convertToLlm(messages)).trim();
+			if (serialized) {
+				const limited = truncateTail(serialized, { maxBytes: MAX_PARENT_CONTEXT_BYTES, maxLines: Number.MAX_SAFE_INTEGER });
+				parentContext = limited.truncated ? `[Earlier conversation omitted]\n${limited.content}` : limited.content;
+			}
+		}
 
 		const squadId = randomUUID();
 		const shortId = squadId.replaceAll("-", "").slice(0, 6);
@@ -507,8 +541,8 @@ export default function (pi: ExtensionAPI) {
 			const promptPath = join(runDir, `prompt-${identity.agentId}.md`);
 			const prompt =
 				kind === "worker"
-					? buildWorkerPrompt(task, assignment.label, assignment.scope, assignment.writableRoots ?? [], assignment.prompt, webTools)
-					: buildInvestigationPrompt(task, assignment.label, assignment.scope, assignment.prompt, webTools);
+					? buildWorkerPrompt(task, assignment.label, assignment.scope, assignment.writableRoots ?? [], assignment.prompt, webTools, parentContext)
+					: buildInvestigationPrompt(task, assignment.label, assignment.scope, assignment.prompt, webTools, parentContext);
 			await writeFile(promptPath, prompt, { encoding: "utf8", mode: 0o600 });
 			agents.push({
 				agentId: identity.agentId,
@@ -541,6 +575,7 @@ export default function (pi: ExtensionAPI) {
 			model,
 			modelSource,
 			webTools,
+			inheritedContext: parentContext !== undefined,
 			status: "launching",
 			agents,
 		};
@@ -618,7 +653,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text" as const,
-						text: `Started ${kind === "worker" ? "worker" : "read-only investigation"} Herdr squad ${squadId}.\nTabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ")}\nModel: ${state.model ?? "Pi default"} (${state.modelSource})\nWeb tools: ${webTools.join(", ") || "none"}\n${formatAgentList(state)}\n\nYou will receive an automatic follow-up message when the squad finishes or needs attention. Either call herdr_squad_wait with this squadId in the next tool round, or continue independent work and collect when notified. Do not poll with short waits.`,
+						text: `Started ${kind === "worker" ? "worker" : "read-only investigation"} Herdr squad ${squadId}.\nTabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ")}\nModel: ${state.model ?? "Pi default"} (${state.modelSource})\nWeb tools: ${webTools.join(", ") || "none"}\nParent context: ${parentContext ? "inherited" : "not inherited"}\n${formatAgentList(state)}\n\nYou will receive an automatic follow-up message when the squad finishes or needs attention. Either call herdr_squad_wait with this squadId in the next tool round, or continue independent work and collect when notified. Do not poll with short waits.`,
 					},
 				],
 				details: publicSquadDetails(state),
@@ -858,6 +893,86 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: output }],
 				details: { ...publicSquadDetails(state), structuredCount, stillRunning, fullOutputPath },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "herdr_squad_steer",
+		label: "Steer Herdr Squad Agent",
+		description:
+			"Send a message to one child in a running or finished squad: a correction, extra context, or a follow-up request. A working child receives it after its current tool calls; an idle or finished child starts a new turn. A child that already reported must report again, so wait for or collect its updated report.",
+		promptSnippet: "Send a correction or follow-up message to a Herdr squad child",
+		promptGuidelines: [
+			"Use herdr_squad_steer to redirect a squad child or ask it a follow-up instead of starting a new squad for the same scope.",
+			"Keep herdr_squad_steer messages within the child's original scope and ownership; start a new squad for different work.",
+		],
+		parameters: SteerParams,
+		async execute(_toolCallId, params, signal) {
+			const state = getSquad(params.squadId);
+			if (state.status === "closed" || state.status === "launching") throw new Error(`Squad ${state.squadId} is ${state.status} and cannot be steered`);
+			const needle = params.agent.trim().toLocaleLowerCase();
+			const agent = state.agents.find((candidate) => candidate.label.toLocaleLowerCase() === needle || candidate.agentId === params.agent.trim());
+			if (!agent) throw new Error(`No agent "${params.agent}" in squad ${state.squadId}. Agents: ${state.agents.map((item) => item.label).join(", ")}`);
+			const message = cleanBody(params.message, MAX_STEER_LENGTH);
+			if (!message) throw new Error("message must not be empty");
+
+			const live = await refreshLivePanes(state, signal);
+			if (live.missingTabs.includes(agent.tabLabel) || live.missing.includes(agent.label)) {
+				throw new Error(`The pane for ${agent.label} is no longer available`);
+			}
+
+			// Set aside an existing report so the squad waits for the child's updated one.
+			let supersededReport: string | undefined;
+			if (await readSquadReport(agent.reportPath)) {
+				supersededReport = agent.reportPath.replace(/\.json$/, `.superseded-${Date.now()}.json`);
+				await rename(agent.reportPath, supersededReport);
+			}
+
+			const steer: SquadSteerMessage = { version: 1, squadId: state.squadId, agentId: agent.agentId, message, createdAt: new Date().toISOString() };
+			const fileName = `${steerFilePrefix(agent.agentId)}${Date.now()}-${randomBytes(4).toString("hex")}.json`;
+			const steerPath = join(state.runDir, fileName);
+			const temporaryPath = join(state.runDir, `.${fileName}.tmp`);
+			await writeFile(temporaryPath, `${JSON.stringify(steer, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+			await rename(temporaryPath, steerPath);
+
+			// The child restarts work, so forget its finished status and resume watching the squad.
+			const key = `${state.squadId}:${agent.agentId}`;
+			statusSince.delete(key);
+			seenWorking.delete(key);
+			if (state.status !== "running") {
+				state.status = "running";
+				delete state.failure;
+			}
+			saveState(state);
+			watchSquad(state.squadId);
+
+			let delivered = false;
+			const deadline = Date.now() + STEER_ACK_WAIT_MS;
+			while (Date.now() < deadline) {
+				try {
+					await access(`${steerPath}${STEER_DELIVERED_SUFFIX}`);
+					delivered = true;
+					break;
+				} catch {
+					await delay(250, signal);
+				}
+			}
+
+			const deliveryText = delivered
+				? `Delivered to ${agent.label} (pane ${agent.paneId}).`
+				: `Queued for ${agent.label} (pane ${agent.paneId}), but the child has not picked it up yet. It is delivered when the child's squad extension next polls; if the pane no longer runs Pi, it will never arrive.`;
+			const reportText = supersededReport
+				? ` Its previous report was set aside (${supersededReport}); it will submit an updated one.`
+				: "";
+			return {
+				content: [
+					{
+						type: "text",
+						text: `${deliveryText}${reportText} You will receive an automatic follow-up when the squad finishes; then call herdr_squad_collect with squadId ${state.squadId}.`,
+					},
+				],
+				details: { ...publicSquadDetails(state), steeredAgent: agent.label, delivered, supersededReport },
 			};
 		},
 	});

@@ -113,7 +113,7 @@ export async function validateExclusiveWritableRoots(
 		if (roots.length === 0) throw new Error(`${assignment.label} requires at least one writable root`);
 		if (new Set(roots).size !== roots.length) throw new Error(`${assignment.label} has duplicate writable roots`);
 		if (roots.includes(".") && (relativeAssignments.length !== 1 || roots.length !== 1)) {
-			throw new Error("writableRoots may contain '.' only when one worker owns the full checkout");
+			throw new Error("writableRoots may contain '.' only when one agent owns the full checkout and no other agent has writable roots");
 		}
 		return { label: assignment.label, writableRoots: roots };
 	});
@@ -148,7 +148,7 @@ export async function validateExclusiveWritableRoots(
 	}));
 }
 
-export async function assertWorkerWriteAllowed(
+export async function assertAgentWriteAllowed(
 	checkoutRoot: string,
 	writableRoots: string[],
 	target: string,
@@ -158,7 +158,7 @@ export async function assertWorkerWriteAllowed(
 	const canonicalRoots =
 		canonicalWritableRoots ?? (await Promise.all(writableRoots.map((root) => canonicalizeWritableRoot(checkoutRoot, root))));
 	if (!canonicalRoots.some((root) => pathContains(root, resolvedTarget.repositoryPath))) {
-		throw new Error(`Write blocked: ${target} is outside this worker's writable roots (${writableRoots.join(", ")})`);
+		throw new Error(`Write blocked: ${target} is outside this agent's writable roots (${writableRoots.join(", ")})`);
 	}
 	return resolvedTarget.absolutePath;
 }

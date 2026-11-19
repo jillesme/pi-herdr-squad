@@ -15,12 +15,13 @@ import {
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { registerChildReportTool } from "./child.ts";
+import { registerAgentTools } from "./agent.ts";
 import { resolveConfiguredModel, validateExplicitModel } from "./config.ts";
 import { validateExclusiveWritableRoots } from "./ownership.ts";
 import {
-	buildInvestigationPrompt,
-	buildWorkerPrompt,
+	buildReadOnlyAgentPrompt,
+	buildWritableAgentPrompt,
+	inlineReportBytes,
 	MANIFEST_FILE,
 	MAX_AGENTS,
 	MAX_AGENTS_PER_TAB,
@@ -51,20 +52,32 @@ const MAX_WAIT_MS = 30 * 60_000;
 const POLL_INTERVAL_MS = 2_000;
 const WATCH_INTERVAL_MS = 5_000;
 const BLOCKED_GRACE_MS = 3_000;
-// Children that reached idle/done without a report are treated as finished after this grace.
+// Agents that reached idle/done without a report are treated as finished after this grace.
 const FINISHED_GRACE_MS = 4_000;
-// Before a child has been seen working, idle may just mean Pi is still starting up.
+// Before an agent has been seen working, idle may just mean Pi is still starting up.
 const STARTUP_IDLE_GRACE_MS = 90_000;
 const NOTIFY_MESSAGE_TYPE = "herdr-squad-update";
-// Tail of the parent conversation inlined into each child prompt when inheritContext is set.
+// Tail of the parent conversation inlined into each agent prompt when inheritContext is set.
 const MAX_PARENT_CONTEXT_BYTES = 40_000;
 const MAX_STEER_LENGTH = 8_000;
 const STEER_ACK_WAIT_MS = 5_000;
+// Collected report sections share this much; the rest of the tool-output limit is left for headers and notes.
+const COLLECT_BUDGET_BYTES = DEFAULT_MAX_BYTES - 5_000;
+const DEFAULT_TERMINAL_LINES = 240;
+const AFTER_REPORTS_HINT =
+	"Agent reports are claims, not proof: verify changes by agents with write access in the checkout diff. Call herdr_squad_close when the tabs are no longer needed.";
 
 const AssignmentSchema = Type.Object({
 	label: Type.String({ description: "Short unique agent label", minLength: 1, maxLength: 80 }),
-	scope: Type.String({ description: "Exclusive, non-overlapping investigation scope", minLength: 1, maxLength: MAX_SCOPE_LENGTH }),
-	prompt: Type.String({ description: "Specific read-only investigation instructions", minLength: 1, maxLength: MAX_PROMPT_LENGTH }),
+	scope: Type.String({ description: "This agent's exclusive, non-overlapping responsibility", minLength: 1, maxLength: MAX_SCOPE_LENGTH }),
+	prompt: Type.String({ description: "Specific, self-contained instructions for this agent", minLength: 1, maxLength: MAX_PROMPT_LENGTH }),
+	writableRoots: Type.Optional(
+		Type.Array(Type.String({ description: "Repository-relative file or directory tree (not a glob)", minLength: 1, maxLength: 1000 }), {
+			description:
+				"Omit for a read-only agent. When set, the agent also gets bash, edit, and write, and may modify only these roots. Roots of different agents must not overlap.",
+			maxItems: 100,
+		}),
+	),
 	model: Type.Optional(
 		Type.String({
 			description: "Optional model for this agent only, overriding the squad model (for example a cheaper model for a simple scope)",
@@ -74,76 +87,53 @@ const AssignmentSchema = Type.Object({
 	),
 });
 
-const WorkerAssignmentSchema = Type.Object({
-	label: Type.String({ description: "Short unique worker label", minLength: 1, maxLength: 80 }),
-	scope: Type.String({ description: "Exclusive functional scope", minLength: 1, maxLength: MAX_SCOPE_LENGTH }),
-	writableRoots: Type.Array(Type.String({ description: "Exclusive repository-relative file or directory root", minLength: 1, maxLength: 1000 }), {
-		minItems: 1,
-		maxItems: 100,
-	}),
-	prompt: Type.String({ description: "Specific implementation instructions", minLength: 1, maxLength: MAX_PROMPT_LENGTH }),
+const StartParams = Type.Object({
+	task: Type.String({ description: "Full parent task, shared with every agent", minLength: 1, maxLength: MAX_TASK_LENGTH }),
+	assignments: Type.Array(AssignmentSchema, { description: "One entry per agent", minItems: 1, maxItems: MAX_AGENTS }),
+	title: Type.Optional(Type.String({ description: "Short tab title", maxLength: 80 })),
 	model: Type.Optional(
 		Type.String({
-			description: "Optional model for this agent only, overriding the squad model (for example a cheaper model for a simple scope)",
+			description: "Optional model for every agent, for example provider/model or model:thinking; an assignment model overrides it",
 			minLength: 1,
 			maxLength: 200,
 		}),
 	),
+	focus: Type.Optional(Type.Boolean({ description: "Focus the first squad tab after launch; defaults to false" })),
+	webTools: Type.Optional(
+		Type.Boolean({
+			description: `Give agents the parent's web tools (${WEB_TOOL_NAMES.join(", ")}) when available; defaults to true`,
+		}),
+	),
+	inheritContext: Type.Optional(
+		Type.Boolean({
+			description:
+				"Include the recent parent conversation (serialized, most recent ~40KB) in every agent prompt as background, so prompts need not restate discussed context; defaults to false",
+		}),
+	),
 });
-
-function startSchema(assignmentSchema: typeof AssignmentSchema | typeof WorkerAssignmentSchema) {
-	return Type.Object({
-		task: Type.String({ description: "Full parent task", minLength: 1, maxLength: MAX_TASK_LENGTH }),
-		count: Type.Integer({ description: "Exact number of visible agents", minimum: 1, maximum: MAX_AGENTS }),
-		assignments: Type.Array(assignmentSchema, { minItems: 1, maxItems: MAX_AGENTS }),
-		title: Type.Optional(Type.String({ description: "Short tab title", maxLength: 80 })),
-		model: Type.Optional(
-			Type.String({
-				description: "Optional model for every child, for example provider/model or model:thinking; an assignment model overrides it",
-				minLength: 1,
-				maxLength: 200,
-			}),
-		),
-		focus: Type.Optional(Type.Boolean({ description: "Focus the first squad tab after launch; defaults to false" })),
-		webTools: Type.Optional(
-			Type.Boolean({
-				description: `Give children the parent's web tools (${WEB_TOOL_NAMES.join(", ")}) when available; defaults to true`,
-			}),
-		),
-		inheritContext: Type.Optional(
-			Type.Boolean({
-				description:
-					"Include the recent parent conversation (serialized, most recent ~40KB) in every child prompt as background, so prompts need not restate discussed context; defaults to false",
-			}),
-		),
-	});
-}
-
-const StartParams = startSchema(AssignmentSchema);
-const WorkerStartParams = startSchema(WorkerAssignmentSchema);
 
 const SquadIdParams = Type.Object({
-	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+	squadId: Type.String({ description: "Opaque squad ID returned by herdr_squad_start", minLength: 8, maxLength: 80 }),
 	timeoutMs: Type.Optional(Type.Integer({ description: "Overall wait timeout in milliseconds", minimum: 1_000, maximum: MAX_WAIT_MS })),
 });
 
 const StatusParams = Type.Object({
-	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+	squadId: Type.String({ description: "Opaque squad ID returned by herdr_squad_start", minLength: 8, maxLength: 80 }),
 });
 
 const SteerParams = Type.Object({
-	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
-	agent: Type.String({ description: "Assignment label (or agent ID) of the child to message", minLength: 1, maxLength: 80 }),
-	message: Type.String({ description: "Message for the child: a correction, extra context, or a follow-up request", minLength: 1, maxLength: MAX_STEER_LENGTH }),
+	squadId: Type.String({ description: "Opaque squad ID returned by herdr_squad_start", minLength: 8, maxLength: 80 }),
+	agent: Type.String({ description: "Assignment label (or agent ID) of the agent to message", minLength: 1, maxLength: 80 }),
+	message: Type.String({ description: "Message for the agent: a correction, extra context, or a follow-up request", minLength: 1, maxLength: MAX_STEER_LENGTH }),
 });
 
 const CloseParams = Type.Object({
-	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+	squadId: Type.String({ description: "Opaque squad ID returned by herdr_squad_start", minLength: 8, maxLength: 80 }),
 	force: Type.Optional(Type.Boolean({ description: "Close tabs even when agents are still running; defaults to false" })),
 });
 
 const CollectParams = Type.Object({
-	squadId: Type.String({ description: "Opaque squad ID returned by a Herdr squad start tool", minLength: 8, maxLength: 80 }),
+	squadId: Type.String({ description: "Opaque squad ID returned by herdr_squad_start", minLength: 8, maxLength: 80 }),
 	lines: Type.Optional(Type.Integer({ description: "Terminal-tail lines used only when a structured report is missing", minimum: 40, maximum: 2_000 })),
 });
 
@@ -160,7 +150,6 @@ interface LaunchAssignment {
 
 interface StartInput {
 	task: string;
-	count: number;
 	assignments: Array<{ label: string; scope: string; prompt: string; writableRoots?: string[]; model?: string }>;
 	title?: string;
 	model?: string;
@@ -244,27 +233,50 @@ function formatList(items: string[], empty = "None reported"): string {
 	return items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : `- ${empty}`;
 }
 
-function formatReport(report: Awaited<ReturnType<typeof readSquadReport>>, sourcePath: string, kind: SquadKind, roots?: string[]): string {
+function formatReport(report: Awaited<ReturnType<typeof readSquadReport>>, sourcePath: string, roots?: string[]): string {
 	if (!report) return "";
-	const workerSections =
-		kind === "worker"
-			? `\n## Writable roots\n${formatList(roots ?? [], "None")}` +
-				`\n## Changed files\n${
-					report.changedFiles && report.changedFiles.length > 0
-						? report.changedFiles.map((item) => `- ${item.path}: ${item.summary}`).join("\n")
-						: "- No files changed"
-				}` +
-				`\n## Validation\n${
-					report.validation && report.validation.length > 0
-						? report.validation.map((item) => `- \`${item.command}\`: ${item.result}`).join("\n")
-						: "- No validation reported"
-				}`
-			: "";
-	return `# Squad Report: ${report.label}\n## Scope\n${report.scope}\n## Recommended next step\n${report.recommendedNextStep || "None reported"}\n## ${kind === "worker" ? "Completion summary" : "Findings"}\n${report.findings}\n## Evidence\n${formatList(report.evidence)}${workerSections}\n## Risks / Unknowns / Handoffs\n${formatList(report.risksOrUnknowns)}\n\nStructured report: ${sourcePath}`;
+	const writableSections = roots
+		? `\n## Writable roots\n${formatList(roots, "None")}` +
+			`\n## Changed files\n${
+				report.changedFiles && report.changedFiles.length > 0
+					? report.changedFiles.map((item) => `- ${item.path}: ${item.summary}`).join("\n")
+					: "- No files changed"
+			}` +
+			`\n## Validation\n${
+				report.validation && report.validation.length > 0
+					? report.validation.map((item) => `- \`${item.command}\`: ${item.result}`).join("\n")
+					: "- No validation reported"
+			}`
+		: "";
+	// The parent wrote the scope, so one line is enough; the budget goes to the agent's own words.
+	return `# Squad Report: ${report.label}\nScope: ${normalizeDisplayText(report.scope, 200)}\n## Recommended next step\n${report.recommendedNextStep || "None reported"}\n## ${roots ? "Completion summary" : "Findings"}\n${report.findings}\n## Evidence\n${formatList(report.evidence)}${writableSections}\n## Risks / Unknowns / Handoffs\n${formatList(report.risksOrUnknowns)}\n\nStructured report: ${sourcePath}`;
+}
+
+// Share the output budget fairly: short sections leave their unused share to longer ones.
+function allocateBudgets(sizes: number[], total: number): number[] {
+	const budgets = new Array<number>(sizes.length).fill(0);
+	let remaining = total;
+	const ascending = sizes.map((size, index) => ({ size, index })).sort((a, b) => a.size - b.size);
+	ascending.forEach(({ size, index }, position) => {
+		budgets[index] = Math.min(size, Math.floor(remaining / (ascending.length - position)));
+		remaining -= budgets[index];
+	});
+	return budgets;
+}
+
+function clipToBytes(text: string, maxBytes: number): string {
+	const buffer = Buffer.from(text, "utf8");
+	if (buffer.length <= maxBytes) return text;
+	// Drop a split trailing character, then prefer ending on a complete line.
+	const cut = buffer.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/, "");
+	const lineEnd = cut.lastIndexOf("\n");
+	return lineEnd > cut.length / 2 ? cut.slice(0, lineEnd) : cut;
 }
 
 export default function (pi: ExtensionAPI) {
-	if (registerChildReportTool(pi)) return;
+	if (registerAgentTools(pi)) return;
+	// Squads need Herdr panes; outside Herdr the tools would only fail, so leave them out of the prompt.
+	if (process.env.HERDR_ENV !== "1") return;
 
 	const squads = new Map<string, SquadState>();
 
@@ -357,7 +369,7 @@ export default function (pi: ExtensionAPI) {
 		return { allTabsFound: missingTabs.length === 0, missingTabs, missing };
 	}
 
-	// Per-agent Herdr status history, used to tell startup idle apart from a finished child.
+	// Per-agent Herdr status history, used to tell startup idle apart from a finished agent.
 	const statusSince = new Map<string, { status: string; since: number }>();
 	const seenWorking = new Set<string>();
 
@@ -379,8 +391,8 @@ export default function (pi: ExtensionAPI) {
 		if (completeCount === state.agents.length) return { kind: "complete", completeCount };
 
 		const live = await refreshLivePanes(state, signal);
-		// A reported child's pane may already have been closed; only missing
-		// children whose results are still outstanding prevent completion.
+		// A reported agent's pane may already have been closed; only missing
+		// agents whose results are still outstanding prevent completion.
 		const missingAgents = state.agents.filter((agent, index) => !reports[index] && live.missing.includes(agent.label));
 		// Collect every problem instead of stopping at the first, so the remaining agents stay tracked.
 		const problems: string[] = [];
@@ -452,7 +464,7 @@ export default function (pi: ExtensionAPI) {
 				// Shutdown, steering or another tool may have changed state while I/O was in flight.
 				if (watchers.get(squadId) !== timer || state.updatedAt !== revision || waiting.has(squadId)) return;
 				if (check.kind === "pending") {
-					// The problem cleared (for example a blocked child resumed); a recurrence is news again.
+					// The problem cleared (for example a blocked agent resumed); a recurrence is news again.
 					delete state.notifiedProblem;
 					return;
 				}
@@ -460,19 +472,19 @@ export default function (pi: ExtensionAPI) {
 				if (check.kind === "problem" && state.notifiedProblem === problemKey(check)) return;
 				let text: string;
 				if (check.kind === "complete") {
+					// Deliver the reports with the notification so the parent needs no separate collect call.
+					const collection = await collectSquad(state, DEFAULT_TERMINAL_LINES);
+					if (watchers.get(squadId) !== timer) return;
 					stopWatching(squadId);
-					state.status = "completed";
-					delete state.failure;
-					delete state.notifiedProblem;
-					text = `Herdr squad "${state.title}" finished: all ${check.completeCount} reports are ready. Call herdr_squad_collect with squadId ${state.squadId}.`;
+					text = `Herdr squad "${state.title}" finished: all ${check.completeCount} reports are included below. ${AFTER_REPORTS_HINT}\n\n${collection.output}`;
 				} else {
 					state.notifiedProblem = problemKey(check);
 					state.status = "partial";
 					state.failure = check.message;
 					const more = check.running.length > 0 ? " Running agents are still watched; you will be notified as more reports arrive." : "";
-					text = `Herdr squad "${state.title}" needs attention: ${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Call herdr_squad_collect with squadId ${state.squadId} to see reports and terminal output.${more}`;
+					text = `Herdr squad "${state.title}" needs attention: ${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Call herdr_squad_collect with squadId ${state.squadId} to see the available reports and terminal output.${more}`;
+					saveState(state);
 				}
-				saveState(state);
 				pi.sendMessage(
 					{ customType: NOTIFY_MESSAGE_TYPE, content: text, display: true, details: { squadId: state.squadId, status: state.status } },
 					{ deliverAs: "followUp", triggerTurn: true },
@@ -502,21 +514,19 @@ export default function (pi: ExtensionAPI) {
 		for (const squadId of [...watchers.keys()]) stopWatching(squadId);
 	});
 
-	async function launchSquad(kind: SquadKind, params: StartInput, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
-		if (process.env.HERDR_ENV !== "1") throw new Error("Herdr squads are available only inside a Herdr-managed Pi pane");
-		if (!Number.isInteger(params.count) || params.count < 1 || params.count > MAX_AGENTS) {
-			throw new Error(`count must be an integer from 1 through ${MAX_AGENTS}`);
-		}
-		if (params.assignments.length !== params.count) throw new Error(`Expected exactly ${params.count} assignments`);
+	async function launchSquad(params: StartInput, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
+		const count = params.assignments.length;
+		if (count < 1 || count > MAX_AGENTS) throw new Error(`A squad needs 1 through ${MAX_AGENTS} assignments`);
 
 		const task = cleanBody(params.task, MAX_TASK_LENGTH);
 		if (!task) throw new Error("task must not be empty");
-		let normalizedAssignments: LaunchAssignment[] = params.assignments.map((assignment) => ({
+		const normalizedAssignments: LaunchAssignment[] = params.assignments.map((assignment) => ({
 			label: normalizeDisplayText(assignment.label, 30),
 			scope: cleanBody(assignment.scope, MAX_SCOPE_LENGTH),
 			prompt: cleanBody(assignment.prompt, MAX_PROMPT_LENGTH),
 			...(assignment.model ? { model: validateExplicitModel(assignment.model, `assignments[${assignment.label}].model`) } : {}),
-			...(kind === "worker" ? { writableRoots: assignment.writableRoots ?? [] } : {}),
+			// Write access is per agent: an assignment without writable roots is read-only.
+			...(assignment.writableRoots && assignment.writableRoots.length > 0 ? { writableRoots: assignment.writableRoots } : {}),
 		}));
 		if (normalizedAssignments.some((assignment) => !assignment.label || !assignment.scope || !assignment.prompt)) {
 			throw new Error("Every assignment requires a non-empty label, scope, and prompt");
@@ -527,17 +537,18 @@ export default function (pi: ExtensionAPI) {
 		if (new Set(scopes).size !== scopes.length) throw new Error("Assignment scopes must not be exact duplicates");
 
 		const checkoutRoot = await realpath(ctx.cwd);
-		if (kind === "worker") {
+		const writable = normalizedAssignments.filter((assignment) => assignment.writableRoots);
+		if (writable.length > 0) {
 			const ownership = await validateExclusiveWritableRoots(
 				checkoutRoot,
-				normalizedAssignments.map((assignment) => ({ label: assignment.label, writableRoots: assignment.writableRoots ?? [] })),
+				writable.map((assignment) => ({ label: assignment.label, writableRoots: assignment.writableRoots ?? [] })),
 			);
-			normalizedAssignments = normalizedAssignments.map((assignment, index) => ({
-				...assignment,
-				writableRoots: ownership[index].writableRoots,
-				canonicalWritableRoots: ownership[index].canonicalWritableRoots,
-			}));
+			writable.forEach((assignment, index) => {
+				assignment.writableRoots = ownership[index].writableRoots;
+				assignment.canonicalWritableRoots = ownership[index].canonicalWritableRoots;
+			});
 		}
+		const kind: SquadKind = writable.length > 0 ? "worker" : "investigation";
 
 		const parentPaneId = process.env.HERDR_PANE_ID;
 		if (!parentPaneId) throw new Error("HERDR_PANE_ID is unavailable; cannot identify the parent pane safely");
@@ -548,14 +559,14 @@ export default function (pi: ExtensionAPI) {
 		let model: string | undefined;
 		let modelSource: SquadState["modelSource"];
 		if (params.model) {
-			model = validateExplicitModel(params.model, kind === "worker" ? "herdr_worker_squad_start.model" : "herdr_squad_start.model");
+			model = validateExplicitModel(params.model, "herdr_squad_start.model");
 			modelSource = "explicit";
 		} else {
 			const configuredModel = await resolveConfiguredModel(checkoutRoot, ctx.isProjectTrusted());
 			model = configuredModel.model;
 			modelSource = configuredModel.source;
 		}
-		// Children load the same packages as the parent, so pass through web tools the parent has.
+		// Agents load the same packages as the parent, so pass through web tools the parent has.
 		const availableTools = new Set(pi.getAllTools().map((tool) => tool.name));
 		const webTools = params.webTools === false ? [] : WEB_TOOL_NAMES.filter((name) => availableTools.has(name));
 		let parentContext: string | undefined;
@@ -570,9 +581,9 @@ export default function (pi: ExtensionAPI) {
 
 		const squadId = randomUUID();
 		const shortId = squadId.replaceAll("-", "").slice(0, 6);
-		const defaultTitle = kind === "worker" ? `Workers ${shortId}` : `Investigation ${shortId}`;
+		const defaultTitle = `Squad ${shortId}`;
 		const title = normalizeDisplayText(params.title || defaultTitle, 38) || defaultTitle;
-		const tabCount = Math.ceil(params.count / MAX_AGENTS_PER_TAB);
+		const tabCount = Math.ceil(count / MAX_AGENTS_PER_TAB);
 		const tabLabels = Array.from({ length: tabCount }, (_, index) =>
 			tabCount === 1 ? `${title} · sq-${shortId}` : `${title} ${index + 1}/${tabCount} · sq-${shortId}`,
 		);
@@ -582,22 +593,23 @@ export default function (pi: ExtensionAPI) {
 			token: randomBytes(24).toString("hex"),
 			label: assignment.label,
 			scope: assignment.scope,
-			...(kind === "worker"
+			...(assignment.writableRoots
 				? { writableRoots: assignment.writableRoots, canonicalWritableRoots: assignment.canonicalWritableRoots }
 				: {}),
 		}));
 		const manifest: SquadManifest = { version: 2, squadId, kind, checkoutRoot, agents: manifestAgents };
 		await writeFile(join(runDir, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 
+		// Tell every agent how much of its report the parent is guaranteed to see inline.
+		const inlineBytes = inlineReportBytes(COLLECT_BUDGET_BYTES, count);
 		const agents: SquadAgentState[] = [];
 		for (let index = 0; index < normalizedAssignments.length; index++) {
 			const assignment = normalizedAssignments[index];
 			const identity = manifestAgents[index];
 			const promptPath = join(runDir, `prompt-${identity.agentId}.md`);
-			const prompt =
-				kind === "worker"
-					? buildWorkerPrompt(task, assignment.label, assignment.scope, assignment.writableRoots ?? [], assignment.prompt, webTools, parentContext)
-					: buildInvestigationPrompt(task, assignment.label, assignment.scope, assignment.prompt, webTools, parentContext);
+			const prompt = assignment.writableRoots
+				? buildWritableAgentPrompt(task, assignment.label, assignment.scope, assignment.writableRoots, assignment.prompt, webTools, inlineBytes, parentContext)
+				: buildReadOnlyAgentPrompt(task, assignment.label, assignment.scope, assignment.prompt, webTools, inlineBytes, parentContext);
 			await writeFile(promptPath, prompt, { encoding: "utf8", mode: 0o600 });
 			agents.push({
 				agentId: identity.agentId,
@@ -610,7 +622,7 @@ export default function (pi: ExtensionAPI) {
 				reportPath: join(runDir, reportFileName(identity.agentId)),
 				promptPath,
 				...(assignment.model && assignment.model !== model ? { model: assignment.model } : {}),
-				...(kind === "worker" ? { writableRoots: assignment.writableRoots } : {}),
+				...(assignment.writableRoots ? { writableRoots: assignment.writableRoots } : {}),
 			});
 		}
 
@@ -637,7 +649,7 @@ export default function (pi: ExtensionAPI) {
 		};
 
 		try {
-			onUpdate?.({ content: [{ type: "text", text: `Creating ${tabCount} Herdr squad tab(s) for ${params.count} agent(s)...` }] });
+			onUpdate?.({ content: [{ type: "text", text: `Creating ${tabCount} Herdr squad tab(s) for ${count} agent(s)...` }] });
 			for (let tabIndex = 0; tabIndex < tabCount; tabIndex++) {
 				const tabResponse = await herdr(
 					["tab", "create", "--workspace", workspaceId, "--cwd", checkoutRoot, "--label", tabLabels[tabIndex], "--no-focus"],
@@ -685,7 +697,6 @@ export default function (pi: ExtensionAPI) {
 					`HERDR_SQUAD_ID=${squadId}`,
 					`HERDR_SQUAD_AGENT_ID=${agent.agentId}`,
 					`HERDR_SQUAD_TOKEN=${identity.token}`,
-					`HERDR_SQUAD_KIND=${kind}`,
 					"pi",
 					"--name",
 					`Squad ${agent.label}`,
@@ -693,11 +704,11 @@ export default function (pi: ExtensionAPI) {
 				const agentModel = agent.model ?? state.model;
 				if (agentModel) commandArguments.push("--model", agentModel);
 				const tools = [
-					...(kind === "worker" ? ["read", "bash", "edit", "write", "grep", "find", "ls"] : ["read", "grep", "find", "ls"]),
+					...(agent.writableRoots ? ["read", "bash", "edit", "write", "grep", "find", "ls"] : ["read", "grep", "find", "ls"]),
 					...webTools,
 					"herdr_squad_report",
 				];
-				// Skills stay enabled so children can follow domain skills (for example Remotion or Cloudflare docs).
+				// Skills stay enabled so agents can follow domain skills (for example Remotion or Cloudflare docs).
 				commandArguments.push("--tools", tools.join(","), "--no-prompt-templates", `@${agent.promptPath}`);
 				await runHerdr(["pane", "run", agent.paneId, commandArguments.map(shellQuote).join(" ")], signal);
 			}
@@ -710,7 +721,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text" as const,
-						text: `Started ${kind === "worker" ? "worker" : "read-only investigation"} Herdr squad ${squadId}.\nTabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ")}\nModel: ${state.model ?? "Pi default"} (${state.modelSource})\nWeb tools: ${webTools.join(", ") || "none"}\nParent context: ${parentContext ? "inherited" : "not inherited"}\n${formatAgentList(state)}\n\nYou will receive an automatic follow-up message when the squad finishes or needs attention. Either call herdr_squad_wait with this squadId in the next tool round, or continue independent work and collect when notified. Do not poll with short waits.`,
+						text: `Started Herdr squad ${squadId}: ${count} agent(s), ${writable.length} with write access.\nTabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ")}\nModel: ${state.model ?? "Pi default"} (${state.modelSource})\nWeb tools: ${webTools.join(", ") || "none"}\nParent context: ${parentContext ? "inherited" : "not inherited"}\n${formatAgentList(state)}\n\nEither call herdr_squad_wait with this squadId, or continue independent work: an automatic follow-up message delivers the reports when the squad finishes, or tells you when it needs attention. Do not poll with short waits.`,
 					},
 				],
 				details: publicSquadDetails(state),
@@ -736,35 +747,121 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	async function collectSquad(state: SquadState, lines: number, signal?: AbortSignal) {
+		const reports = await Promise.all(state.agents.map((agent) => readAgentReport(state, agent)));
+		// Panes matter only for agents without a report, so a complete squad needs no Herdr calls.
+		const live = reports.every(Boolean) ? undefined : await refreshLivePanes(state, signal);
+		const missingPanes = new Set(live?.missing ?? []);
+		const missingTabs = new Set(live?.missingTabs ?? []);
+		const sections: Array<{ text: string; sourcePath: string }> = [];
+		const stillRunning: string[] = [];
+		let structuredCount = 0;
+
+		for (let index = 0; index < state.agents.length; index++) {
+			const agent = state.agents[index];
+			const report = reports[index];
+			if (report) {
+				structuredCount++;
+				sections.push({ text: formatReport(report, agent.reportPath, agent.writableRoots), sourcePath: agent.reportPath });
+				continue;
+			}
+			const paneLive = !missingTabs.has(agent.tabLabel) && !missingPanes.has(agent.label) && Boolean(agent.paneId);
+			const running = paneLive && mayBeRunning(state, agent);
+			if (running) stillRunning.push(agent.label);
+			let transcript = missingTabs.has(agent.tabLabel)
+				? `Terminal output unavailable because tab ${agent.tabLabel} could not be revalidated.`
+				: missingPanes.has(agent.label)
+					? "Terminal output unavailable because this pane could not be revalidated."
+					: "Terminal output unavailable.";
+			if (paneLive) {
+				try {
+					const result = await pi.exec(
+						"herdr",
+						["pane", "read", agent.paneId, "--source", "recent-unwrapped", "--lines", String(running ? Math.min(lines, 40) : lines)],
+						{ signal, timeout: 15_000 },
+					);
+					if (result.code === 0 && result.stdout.trim()) transcript = result.stdout.trim();
+					else if (result.stderr.trim()) transcript = `Terminal read failed: ${result.stderr.trim()}`;
+				} catch (error) {
+					transcript = `Terminal read failed: ${error instanceof Error ? error.message : String(error)}`;
+				}
+			}
+			const transcriptPath = join(state.runDir, `terminal-${agent.agentId}.txt`);
+			await writeFile(transcriptPath, `${transcript}\n`, { encoding: "utf8", mode: 0o600 });
+			const ownership = agent.writableRoots ? `\n## Writable roots\n${formatList(agent.writableRoots, "None")}` : "";
+			const status = running
+				? `Still running (Herdr status ${agent.lastAgentStatus}); no report yet.${agent.writableRoots ? " Do not modify its writable roots until it reports." : ""}`
+				: `No valid structured report was submitted. Last Herdr status: ${agent.lastAgentStatus ?? "unknown"}.`;
+			sections.push({
+				text: `# Squad Report ${running ? "Pending" : "Missing"}: ${agent.label}\nScope: ${normalizeDisplayText(agent.scope, 200)}${ownership}\n## Tab\n${agent.tabLabel}\n## Status\n${status}\n## Terminal tail\n${transcript}\n\nTerminal snapshot: ${transcriptPath}`,
+				sourcePath: transcriptPath,
+			});
+		}
+
+		// Every agent is guaranteed an equal share of the output; agents were told that share at launch.
+		const budgets = allocateBudgets(sections.map((section) => Buffer.byteLength(section.text, "utf8")), COLLECT_BUDGET_BYTES);
+		let clippedCount = 0;
+		const limited = sections.map((section, index) => {
+			const clipped = clipToBytes(section.text, budgets[index]);
+			if (clipped === section.text) return clipped;
+			clippedCount++;
+			return `${clipped}\n\n[Section truncated. Full source: ${section.sourcePath}]`;
+		});
+
+		const writableCount = state.agents.filter((agent) => agent.writableRoots).length;
+		const overrides = state.agents.filter((agent) => agent.model).map((agent) => `${agent.label}=${agent.model}`);
+		const header = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})${overrides.length > 0 ? `; overrides: ${overrides.join(", ")}` : ""}\n- Agents: ${state.agents.length} (${writableCount} with write access to the shared checkout, ${state.agents.length - writableCount} read-only)\n- Structured reports: ${structuredCount}/${state.agents.length}${stillRunning.length > 0 ? `\n- Still running: ${stillRunning.join(", ")} (you will receive an automatic follow-up when they finish; collect again then)` : ""}`;
+		const truncation = truncateHead(`${header}\n\n${limited.join("\n\n---\n\n")}`, { maxBytes: DEFAULT_MAX_BYTES - 500, maxLines: DEFAULT_MAX_LINES });
+		let output = truncation.content;
+		let fullOutputPath: string | undefined;
+		if (clippedCount > 0 || truncation.truncated) {
+			fullOutputPath = join(state.runDir, "collection.md");
+			const full = `${header}\n\n${sections.map((section) => section.text).join("\n\n---\n\n")}\n`;
+			await withFileMutationQueue(fullOutputPath, () => writeFile(fullOutputPath!, full, { encoding: "utf8", mode: 0o600 }));
+			output += `\n\n[${truncation.truncated ? "Collection" : `${clippedCount} section(s)`} truncated to fit the output limit. Full collection: ${fullOutputPath}]`;
+		}
+
+		// Keep watching a partially collected squad so the parent hears when the rest finish.
+		if (state.status !== "closed") {
+			if (structuredCount === state.agents.length || stillRunning.length === 0) state.status = "collected";
+			else {
+				state.status = "running";
+				watchSquad(state.squadId);
+			}
+		}
+		if (structuredCount === state.agents.length) {
+			delete state.failure;
+			delete state.notifiedProblem;
+		}
+		state.collectedAt = new Date().toISOString();
+		saveState(state);
+		return { output, structuredCount, stillRunning, fullOutputPath };
+	}
+
 	pi.registerTool({
 		name: "herdr_squad_start",
-		label: "Start Herdr Investigation Squad",
+		label: "Start Herdr Squad",
 		description:
-			"Create and launch 1-12 visible, strictly read-only Pi investigation agents across up to three Herdr tabs. An explicit model overrides project/global config, and an assignment model overrides it for that agent. Returns an opaque squadId. Call this tool alone; wait for its result before calling herdr_squad_wait.",
-		promptSnippet: "Launch a visible read-only Herdr investigation squad",
+			`Launch 1-${MAX_AGENTS} visible Pi agents in Herdr panes (up to ${MAX_AGENTS_PER_TAB} per tab) that share the current checkout. An agent is read-only (read, grep, find, ls, plus web tools when enabled) unless its assignment sets writableRoots, which adds bash, edit, and write. Writable roots are enforced for edit and write; bash is not sandboxed. Model precedence: assignment model, then model, then project/global squad config, then Pi's default. Returns an opaque squadId.`,
+		promptSnippet: "Launch a visible Herdr squad of read-only or writable agents",
 		promptGuidelines: [
-			"Call herdr_squad_start only after defining distinct non-overlapping scopes, and call it in a separate tool round before herdr_squad_wait.",
-			"Always include task with the full parent request, plus count and exactly count assignments.",
+			"Give each herdr_squad_start assignment a distinct scope and a self-contained prompt: agents see only task and their own assignment unless inheritContext is true.",
+			"Set writableRoots in herdr_squad_start only for agents that must edit files, with roots that do not overlap, and do not modify those roots yourself until that agent has reported.",
 		],
 		parameters: StartParams,
 		execute(_toolCallId, params, signal, onUpdate, ctx) {
-			return launchSquad("investigation", params as StartInput, signal, onUpdate, ctx);
+			return launchSquad(params as StartInput, signal, onUpdate, ctx);
 		},
 	});
 
+	// Kept for one release so existing prompts keep working; herdr_squad_start accepts the same arguments.
 	pi.registerTool({
 		name: "herdr_worker_squad_start",
-		label: "Start Herdr Worker Squad",
-		description:
-			"Create and launch 1-12 visible coding workers in one shared checkout, across up to three Herdr tabs. Each worker requires exclusive repository-relative writable roots. Returns an opaque squadId. Call this tool alone; wait for its result before herdr_squad_wait.",
-		promptSnippet: "Launch a visible shared-checkout Herdr worker squad",
-		promptGuidelines: [
-			"Inspect the repository before calling herdr_worker_squad_start, then assign exclusive non-overlapping writableRoots and use the smallest useful worker count.",
-			"Call herdr_worker_squad_start alone, and do not modify worker-owned files before wait and collect complete.",
-		],
-		parameters: WorkerStartParams,
+		label: "Start Herdr Squad (deprecated alias)",
+		description: "Deprecated alias of herdr_squad_start. Call herdr_squad_start with writableRoots on each assignment instead.",
+		parameters: StartParams,
 		execute(_toolCallId, params, signal, onUpdate, ctx) {
-			return launchSquad("worker", params as StartInput, signal, onUpdate, ctx);
+			return launchSquad(params as StartInput, signal, onUpdate, ctx);
 		},
 	});
 
@@ -772,17 +869,22 @@ export default function (pi: ExtensionAPI) {
 		name: "herdr_squad_wait",
 		label: "Wait for Herdr Squad",
 		description:
-			"Wait for every child in a previously started investigation or worker squad to submit its structured report. Uses one overall timeout and reports blockers. Call alone after a squad start tool has returned. Running squads also send an automatic follow-up when they finish, so never poll with short timeouts.",
-		promptSnippet: "Wait for a Herdr squad's structured reports",
+			"Wait for every agent in a squad to submit its structured report, and return the reports when all are in. Returns early when an agent needs attention, or at the timeout; a timeout does not stop the agents. Running squads also deliver their reports in an automatic follow-up message when they finish, so never poll with short timeouts.",
+		promptSnippet: "Wait for a Herdr squad and receive its reports",
 		promptGuidelines: [
-			"Call herdr_squad_wait only after a Herdr squad start tool has returned a squadId, and wait for its result before calling herdr_squad_collect.",
-			"Do not poll herdr_squad_wait with short timeouts. To keep working while a squad runs, skip waiting and act on the automatic squad follow-up message; use herdr_squad_status for a quick non-blocking check.",
+			"After herdr_squad_start, either call herdr_squad_wait once with a generous timeout or keep working until the automatic follow-up arrives; both deliver the reports. Never poll herdr_squad_wait with short timeouts; herdr_squad_status is the non-blocking check.",
 		],
 		executionMode: "sequential",
 		parameters: SquadIdParams,
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const state = getSquad(params.squadId);
 			if (state.status === "closed") throw new Error("Cannot wait on a closed squad; collect its saved reports instead");
+			if (state.status === "collected") {
+				return {
+					content: [{ type: "text", text: `Herdr squad ${state.squadId} has no running agents and its results were already delivered. Call herdr_squad_collect to read them again.` }],
+					details: { ...publicSquadDetails(state), timedOut: false },
+				};
+			}
 			const timeoutMs = params.timeoutMs ?? DEFAULT_WAIT_MS;
 			const deadline = Date.now() + timeoutMs;
 
@@ -792,13 +894,10 @@ export default function (pi: ExtensionAPI) {
 					if (signal?.aborted) throw new Error("Herdr squad wait cancelled");
 					const check = await checkSquad(state, signal);
 					if (check.kind === "complete") {
-						state.status = "completed";
-						delete state.failure;
-						delete state.notifiedProblem;
-						saveState(state);
+						const collection = await collectSquad(state, DEFAULT_TERMINAL_LINES, signal);
 						return {
-							content: [{ type: "text", text: `All ${check.completeCount} Herdr squad reports are ready. Call herdr_squad_collect with squadId ${state.squadId} in the next tool round.` }],
-							details: { ...publicSquadDetails(state), completeCount: check.completeCount, timedOut: false },
+							content: [{ type: "text", text: `All ${check.completeCount} Herdr squad reports are included below. ${AFTER_REPORTS_HINT}\n\n${collection.output}` }],
+							details: { ...publicSquadDetails(state), completeCount: check.completeCount, fullOutputPath: collection.fullOutputPath, timedOut: false },
 						};
 					}
 					// A problem the parent already knows about does not end the wait while other agents still run.
@@ -809,7 +908,7 @@ export default function (pi: ExtensionAPI) {
 						saveState(state);
 						return {
 							content: [
-								{ type: "text", text: `${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Collect available reports and terminal output now.` },
+								{ type: "text", text: `${check.completeCount}/${state.agents.length} reports are ready. ${check.message}. Call herdr_squad_collect for the available reports and terminal output.` },
 							],
 							details: { ...publicSquadDetails(state), ...check.details, completeCount: check.completeCount, running: check.running, timedOut: false },
 						};
@@ -826,7 +925,7 @@ export default function (pi: ExtensionAPI) {
 							content: [
 								{
 									type: "text",
-									text: `${check.completeCount}/${state.agents.length} reports were ready after ${Math.round(timeoutMs / 1000)}s. Still running: ${check.running.join(", ")}. The agents keep working and you will receive an automatic follow-up when the squad finishes. Continue independent work or call herdr_squad_wait again; collect now only if you need partial results.`,
+									text: `${check.completeCount}/${state.agents.length} reports were ready after ${Math.round(timeoutMs / 1000)}s. Still running: ${check.running.join(", ")}. The agents keep working and an automatic follow-up will deliver the reports when the squad finishes. Continue independent work or call herdr_squad_wait again; call herdr_squad_collect now only if you need partial results.`,
 								},
 							],
 							details: { ...publicSquadDetails(state), completeCount: check.completeCount, running: check.running, timedOut: true },
@@ -845,9 +944,8 @@ export default function (pi: ExtensionAPI) {
 		name: "herdr_squad_status",
 		label: "Herdr Squad Status",
 		description:
-			"Non-blocking progress check for an investigation or worker squad: which agents have reported and each agent's Herdr status. Does not collect reports.",
+			"Non-blocking progress check for a squad: which agents have reported and each agent's Herdr status. Does not return reports.",
 		promptSnippet: "Check a Herdr squad's progress without waiting",
-		promptGuidelines: ["Use herdr_squad_status for a quick progress check instead of herdr_squad_wait with a short timeout."],
 		parameters: StatusParams,
 		async execute(_toolCallId, params, signal) {
 			const state = getSquad(params.squadId);
@@ -875,93 +973,24 @@ export default function (pi: ExtensionAPI) {
 		name: "herdr_squad_collect",
 		label: "Collect Herdr Squad",
 		description:
-			`Collect structured reports from an investigation or worker squad, with bounded terminal-tail fallbacks. Output is limited to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; complete output is saved when truncated. Call only after herdr_squad_wait returns.`,
-		promptSnippet: "Collect a Herdr squad's reports and fallback terminal output",
-		promptGuidelines: ["Call herdr_squad_collect only after the corresponding herdr_squad_wait call has returned."],
+			`Read a squad's structured reports, with terminal tails for agents that have not reported. Needed only for partial results, missing reports, or to re-read: a completed herdr_squad_wait and the completion follow-up already include the reports. Output is limited to ${formatSize(DEFAULT_MAX_BYTES)} shared equally between agents; the full collection is saved to a file when anything is truncated.`,
+		promptSnippet: "Read a Herdr squad's partial or saved reports and terminal fallbacks",
+		promptGuidelines: [
+			"Call herdr_squad_collect only for partial results, missing reports, or to re-read reports; a completed herdr_squad_wait and the completion follow-up already include them.",
+		],
 		executionMode: "sequential",
 		parameters: CollectParams,
 		async execute(_toolCallId, params, signal) {
 			const state = getSquad(params.squadId);
-			const lines = params.lines ?? 240;
-			const live = await refreshLivePanes(state, signal);
-			const missingPanes = new Set(live.missing);
-			const missingTabs = new Set(live.missingTabs);
-			const perAgentBytes = Math.max(8_000, Math.floor((DEFAULT_MAX_BYTES - 4_000) / state.agents.length));
-			const sections: string[] = [];
-			const stillRunning: string[] = [];
-			let structuredCount = 0;
-
-			for (const agent of state.agents) {
-				const report = await readAgentReport(state, agent);
-				let section: string;
-				if (report) {
-					structuredCount++;
-					section = formatReport(report, agent.reportPath, state.kind, agent.writableRoots);
-				} else {
-					const paneLive = !missingTabs.has(agent.tabLabel) && !missingPanes.has(agent.label) && Boolean(agent.paneId);
-					const running = paneLive && mayBeRunning(state, agent);
-					if (running) stillRunning.push(agent.label);
-					let transcript = missingTabs.has(agent.tabLabel)
-						? `Terminal output unavailable because tab ${agent.tabLabel} could not be revalidated.`
-						: missingPanes.has(agent.label)
-							? "Terminal output unavailable because this pane could not be revalidated."
-							: "Terminal output unavailable.";
-					if (!missingTabs.has(agent.tabLabel) && !missingPanes.has(agent.label) && agent.paneId) {
-						try {
-							const result = await pi.exec(
-								"herdr",
-								["pane", "read", agent.paneId, "--source", "recent-unwrapped", "--lines", String(running ? Math.min(lines, 40) : lines)],
-								{ signal, timeout: 15_000 },
-							);
-							if (result.code === 0 && result.stdout.trim()) transcript = result.stdout.trim();
-							else if (result.stderr.trim()) transcript = `Terminal read failed: ${result.stderr.trim()}`;
-						} catch (error) {
-							transcript = `Terminal read failed: ${error instanceof Error ? error.message : String(error)}`;
-						}
-					}
-					const transcriptPath = join(state.runDir, `terminal-${agent.agentId}.txt`);
-					await writeFile(transcriptPath, `${transcript}\n`, { encoding: "utf8", mode: 0o600 });
-					const ownership = state.kind === "worker" ? `\n## Writable roots\n${formatList(agent.writableRoots ?? [], "None")}` : "";
-					const status = running
-						? `Still running (Herdr status ${agent.lastAgentStatus}); no report yet.${state.kind === "worker" ? " Do not modify its writable roots until it reports." : ""}`
-						: `No valid structured report was submitted. Last Herdr status: ${agent.lastAgentStatus ?? "unknown"}.`;
-					section = `# Squad Report ${running ? "Pending" : "Missing"}: ${agent.label}\n## Scope\n${agent.scope}${ownership}\n## Tab\n${agent.tabLabel}\n## Status\n${status}\n## Terminal tail\n${transcript}\n\nTerminal snapshot: ${transcriptPath}`;
-				}
-
-				const limited = truncateHead(section, { maxBytes: perAgentBytes, maxLines: DEFAULT_MAX_LINES });
-				sections.push(
-					limited.truncated
-						? `${limited.content}\n\n[Agent section truncated. Full source is available at ${report ? agent.reportPath : join(state.runDir, `terminal-${agent.agentId}.txt`)}]`
-						: limited.content,
-				);
-			}
-
-			const fullCollection = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Kind: ${state.kind}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})${state.agents.some((agent) => agent.model) ? `; overrides: ${state.agents.filter((agent) => agent.model).map((agent) => `${agent.label}=${agent.model}`).join(", ")}` : ""}\n- Mode: ${state.kind === "worker" ? "shared-checkout coding workers" : "read-only investigation"}\n- Structured reports: ${structuredCount}/${state.agents.length}${stillRunning.length > 0 ? `\n- Still running: ${stillRunning.join(", ")} (you will receive an automatic follow-up when they finish; collect again then)` : ""}\n\n${sections.join("\n\n---\n\n")}`;
-			const truncation = truncateHead(fullCollection, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
-			let output = truncation.content;
-			let fullOutputPath: string | undefined;
-			if (truncation.truncated) {
-				fullOutputPath = join(state.runDir, "collection.md");
-				await withFileMutationQueue(fullOutputPath, () =>
-					writeFile(fullOutputPath!, `${fullCollection}\n`, { encoding: "utf8", mode: 0o600 }),
-				);
-				output += `\n\n[Collection truncated: showing ${truncation.outputLines}/${truncation.totalLines} lines and ${formatSize(truncation.outputBytes)}/${formatSize(truncation.totalBytes)}. Full collection: ${fullOutputPath}]`;
-			}
-
-			// Keep watching a partially collected squad so the parent hears when the rest finish.
-			if (state.status !== "closed") {
-				if (structuredCount === state.agents.length || stillRunning.length === 0) state.status = "collected";
-				else {
-					state.status = "running";
-					watchSquad(state.squadId);
-				}
-			}
-			if (structuredCount === state.agents.length) delete state.failure;
-			state.collectedAt = new Date().toISOString();
-			saveState(state);
+			const collection = await collectSquad(state, params.lines ?? DEFAULT_TERMINAL_LINES, signal);
 			return {
-				content: [{ type: "text", text: output }],
-				details: { ...publicSquadDetails(state), structuredCount, stillRunning, fullOutputPath },
+				content: [{ type: "text", text: collection.output }],
+				details: {
+					...publicSquadDetails(state),
+					structuredCount: collection.structuredCount,
+					stillRunning: collection.stillRunning,
+					fullOutputPath: collection.fullOutputPath,
+				},
 			};
 		},
 	});
@@ -970,11 +999,10 @@ export default function (pi: ExtensionAPI) {
 		name: "herdr_squad_steer",
 		label: "Steer Herdr Squad Agent",
 		description:
-			"Send a message to one child in a running or finished squad: a correction, extra context, or a follow-up request. A working child receives it after its current tool calls; an idle or finished child starts a new turn. A child that already reported must report again, so wait for or collect its updated report.",
-		promptSnippet: "Send a correction or follow-up message to a Herdr squad child",
+			"Send a message to one agent in a running or finished squad: a correction, extra context, or a follow-up request. A working agent receives it after its current tool calls; an idle or finished agent starts a new turn. An agent that already reported must report again, and its updated report arrives through herdr_squad_wait or the automatic follow-up.",
+		promptSnippet: "Send a correction or follow-up message to a Herdr squad agent",
 		promptGuidelines: [
-			"Use herdr_squad_steer to redirect a squad child or ask it a follow-up instead of starting a new squad for the same scope.",
-			"Keep herdr_squad_steer messages within the child's original scope and ownership; start a new squad for different work.",
+			"Use herdr_squad_steer to correct a squad agent or ask it a follow-up within its original scope and writable roots, instead of starting a new squad for the same scope.",
 		],
 		executionMode: "sequential",
 		parameters: SteerParams,
@@ -992,7 +1020,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`The pane for ${agent.label} is no longer available`);
 			}
 
-			// Set aside an existing report so the squad waits for the child's updated one.
+			// Set aside an existing report so the squad waits for the agent's updated one.
 			let supersededReport: string | undefined;
 			if (await readSquadReport(agent.reportPath)) {
 				supersededReport = agent.reportPath.replace(/\.json$/, `.superseded-${Date.now()}.json`);
@@ -1007,7 +1035,7 @@ export default function (pi: ExtensionAPI) {
 			await rename(temporaryPath, steerPath);
 			agent.pendingSteerId = steer.id;
 
-			// The child restarts work, so forget its finished status and resume watching the squad.
+			// The agent restarts work, so forget its finished status and resume watching the squad.
 			const key = `${state.squadId}:${agent.agentId}`;
 			statusSince.delete(key);
 			seenWorking.delete(key);
@@ -1015,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
 				state.status = "running";
 				delete state.failure;
 			}
-			// The steered child may resolve or repeat a known problem; either outcome is news.
+			// The steered agent may resolve or repeat a known problem; either outcome is news.
 			delete state.notifiedProblem;
 			saveState(state);
 			watchSquad(state.squadId);
@@ -1034,7 +1062,7 @@ export default function (pi: ExtensionAPI) {
 
 			const deliveryText = delivered
 				? `Delivered to ${agent.label} (pane ${agent.paneId}).`
-				: `Queued for ${agent.label} (pane ${agent.paneId}), but the child has not picked it up yet. It is delivered when the child's squad extension next polls; if the pane no longer runs Pi, it will never arrive.`;
+				: `Queued for ${agent.label} (pane ${agent.paneId}), but the agent has not picked it up yet. It is delivered when the agent's squad extension next polls; if the pane no longer runs Pi, it will never arrive.`;
 			const reportText = supersededReport
 				? ` Its previous report was set aside (${supersededReport}); it will submit an updated one.`
 				: "";
@@ -1042,7 +1070,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `${deliveryText}${reportText} You will receive an automatic follow-up when the squad finishes; then call herdr_squad_collect with squadId ${state.squadId}.`,
+						text: `${deliveryText}${reportText} An automatic follow-up will deliver the updated reports when the squad finishes.`,
 					},
 				],
 				details: { ...publicSquadDetails(state), steeredAgent: agent.label, delivered, supersededReport },
@@ -1054,9 +1082,9 @@ export default function (pi: ExtensionAPI) {
 		name: "herdr_squad_close",
 		label: "Close Herdr Squad",
 		description:
-			"Close a squad's Herdr tabs after its results are collected. Refuses while agents are still running unless force is true. Reports and terminal snapshots stay on disk.",
+			"Close a squad's Herdr tabs once its reports are handled. Refuses while agents are still running unless force is true. Reports and terminal snapshots stay on disk.",
 		promptSnippet: "Close a finished Herdr squad's tabs",
-		promptGuidelines: ["Call herdr_squad_close after herdr_squad_collect when the squad's tabs are no longer needed for inspection."],
+		promptGuidelines: ["Call herdr_squad_close once a squad's reports are handled and its tabs are no longer needed for inspection."],
 		executionMode: "sequential",
 		parameters: CloseParams,
 		async execute(_toolCallId, params, signal) {
@@ -1069,7 +1097,7 @@ export default function (pi: ExtensionAPI) {
 					(agent.lastAgentStatus === "working" || agent.lastAgentStatus === "blocked" || (!reports[index] && mayBeRunning(state, agent))),
 			);
 			if (active.length > 0 && params.force !== true) {
-				throw new Error(`Agents are still running: ${active.map((agent) => agent.label).join(", ")}. Collect first, or pass force: true to close anyway.`);
+				throw new Error(`Agents are still running: ${active.map((agent) => agent.label).join(", ")}. Wait for them, or pass force: true to close anyway.`);
 			}
 
 			const missingTabs = new Set(live.missingTabs);

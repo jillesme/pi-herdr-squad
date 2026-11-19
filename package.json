@@ -1,7 +1,7 @@
 {
   "name": "pi-herdr-squad",
-  "version": "0.3.0",
-  "description": "Visible Herdr investigation and shared-checkout coding worker squads for Pi",
+  "version": "0.4.0",
+  "description": "Visible Herdr squads of read-only and coding agents for Pi",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -19,13 +19,12 @@
     "subagents",
     "multi-agent",
     "coding-agents",
-    "parallel-workers"
+    "parallel-agents"
   ],
   "files": [
     "index.ts",
     "agent/extensions/herdr-squad",
     "agent/skills/herdr-squad",
-    "agent/skills/herdr-worker-squad",
     "agent/prompts/herdr-squad.md",
     "agent/prompts/herdr-worker-squad.md",
     "herdr-squad.example.json",
@@ -33,7 +32,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --experimental-strip-types --check index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/child.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/config.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/ownership.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/shared.ts",
+    "check": "node --experimental-strip-types --check index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/index.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/agent.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/config.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/ownership.ts && node --experimental-strip-types --check agent/extensions/herdr-squad/shared.ts",
     "pack:check": "npm pack --dry-run"
   },
   "peerDependencies": {
@@ -51,8 +50,7 @@
       "./index.ts"
     ],
     "skills": [
-      "./agent/skills/herdr-squad",
-      "./agent/skills/herdr-worker-squad"
+      "./agent/skills/herdr-squad"
     ],
     "prompts": [
       "./agent/prompts/herdr-squad.md",

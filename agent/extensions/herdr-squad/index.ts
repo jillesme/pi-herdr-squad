@@ -10,7 +10,6 @@ import {
 	DEFAULT_MAX_LINES,
 	formatSize,
 	serializeConversation,
-	truncateHead,
 	truncateTail,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
@@ -21,7 +20,7 @@ import { validateExclusiveWritableRoots } from "./ownership.ts";
 import {
 	buildReadOnlyAgentPrompt,
 	buildWritableAgentPrompt,
-	inlineReportBytes,
+	inlineReportShare,
 	MANIFEST_FILE,
 	MAX_AGENTS,
 	MAX_AGENTS_PER_TAB,
@@ -61,8 +60,12 @@ const NOTIFY_MESSAGE_TYPE = "herdr-squad-update";
 const MAX_PARENT_CONTEXT_BYTES = 40_000;
 const MAX_STEER_LENGTH = 8_000;
 const STEER_ACK_WAIT_MS = 5_000;
-// Collected report sections share this much; the rest of the tool-output limit is left for headers and notes.
-const COLLECT_BUDGET_BYTES = DEFAULT_MAX_BYTES - 5_000;
+// Report sections are promised this much of the tool-output limit; the rest covers the header, truncation notes and framing.
+const COLLECT_BUDGET_BYTES = DEFAULT_MAX_BYTES - 6_000;
+const COLLECT_BUDGET_LINES = DEFAULT_MAX_LINES - 150;
+// Room for the sentence that wait and the completion follow-up put before a collection.
+const FRAMING_BYTES = 600;
+const FRAMING_LINES = 4;
 const DEFAULT_TERMINAL_LINES = 240;
 const AFTER_REPORTS_HINT =
 	"Agent reports are claims, not proof: verify changes by agents with write access in the checkout diff. Call herdr_squad_close when the tabs are no longer needed.";
@@ -264,11 +267,13 @@ function allocateBudgets(sizes: number[], total: number): number[] {
 	return budgets;
 }
 
-function clipToBytes(text: string, maxBytes: number): string {
-	const buffer = Buffer.from(text, "utf8");
-	if (buffer.length <= maxBytes) return text;
+function clipSection(text: string, maxBytes: number, maxLines: number): string {
+	const lines = text.split("\n");
+	const byLines = lines.length > maxLines ? lines.slice(0, Math.max(0, maxLines)).join("\n") : text;
+	const buffer = Buffer.from(byLines, "utf8");
+	if (buffer.length <= maxBytes) return byLines;
 	// Drop a split trailing character, then prefer ending on a complete line.
-	const cut = buffer.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/, "");
+	const cut = buffer.subarray(0, Math.max(0, maxBytes)).toString("utf8").replace(/\uFFFD$/, "");
 	const lineEnd = cut.lastIndexOf("\n");
 	return lineEnd > cut.length / 2 ? cut.slice(0, lineEnd) : cut;
 }
@@ -473,9 +478,19 @@ export default function (pi: ExtensionAPI) {
 				let text: string;
 				if (check.kind === "complete") {
 					// Deliver the reports with the notification so the parent needs no separate collect call.
-					const collection = await collectSquad(state, DEFAULT_TERMINAL_LINES);
-					if (watchers.get(squadId) !== timer) return;
+					const collection = await buildCollection(state, DEFAULT_TERMINAL_LINES);
+					// Steering may have invalidated a report, or a wait may have started, while the reports were read.
+					// Then the squad is not finished for this watcher: keep watching and announce nothing.
+					if (
+						watchers.get(squadId) !== timer ||
+						state.updatedAt !== revision ||
+						waiting.has(squadId) ||
+						collection.structuredCount !== state.agents.length
+					) {
+						return;
+					}
 					stopWatching(squadId);
+					commitCollection(state, collection, false);
 					text = `Herdr squad "${state.title}" finished: all ${check.completeCount} reports are included below. ${AFTER_REPORTS_HINT}\n\n${collection.output}`;
 				} else {
 					state.notifiedProblem = problemKey(check);
@@ -601,15 +616,15 @@ export default function (pi: ExtensionAPI) {
 		await writeFile(join(runDir, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 
 		// Tell every agent how much of its report the parent is guaranteed to see inline.
-		const inlineBytes = inlineReportBytes(COLLECT_BUDGET_BYTES, count);
+		const inline = inlineReportShare(COLLECT_BUDGET_BYTES, COLLECT_BUDGET_LINES, count);
 		const agents: SquadAgentState[] = [];
 		for (let index = 0; index < normalizedAssignments.length; index++) {
 			const assignment = normalizedAssignments[index];
 			const identity = manifestAgents[index];
 			const promptPath = join(runDir, `prompt-${identity.agentId}.md`);
 			const prompt = assignment.writableRoots
-				? buildWritableAgentPrompt(task, assignment.label, assignment.scope, assignment.writableRoots, assignment.prompt, webTools, inlineBytes, parentContext)
-				: buildReadOnlyAgentPrompt(task, assignment.label, assignment.scope, assignment.prompt, webTools, inlineBytes, parentContext);
+				? buildWritableAgentPrompt(task, assignment.label, assignment.scope, assignment.writableRoots, assignment.prompt, webTools, inline, parentContext)
+				: buildReadOnlyAgentPrompt(task, assignment.label, assignment.scope, assignment.prompt, webTools, inline, parentContext);
 			await writeFile(promptPath, prompt, { encoding: "utf8", mode: 0o600 });
 			agents.push({
 				agentId: identity.agentId,
@@ -747,7 +762,9 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function collectSquad(state: SquadState, lines: number, signal?: AbortSignal) {
+	// Reads reports and renders the collection without changing squad state, so callers can
+	// re-check for concurrent changes (steering) before they commit the result.
+	async function buildCollection(state: SquadState, lines: number, signal?: AbortSignal) {
 		const reports = await Promise.all(state.agents.map((agent) => readAgentReport(state, agent)));
 		// Panes matter only for agents without a report, so a complete squad needs no Herdr calls.
 		const live = reports.every(Boolean) ? undefined : await refreshLivePanes(state, signal);
@@ -798,44 +815,60 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		// Every agent is guaranteed an equal share of the output; agents were told that share at launch.
-		const budgets = allocateBudgets(sections.map((section) => Buffer.byteLength(section.text, "utf8")), COLLECT_BUDGET_BYTES);
+		const writableCount = state.agents.filter((agent) => agent.writableRoots).length;
+		const overrides = state.agents.filter((agent) => agent.model).map((agent) => `${agent.label}=${normalizeDisplayText(agent.model ?? "", 60)}`);
+		const header = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})${overrides.length > 0 ? `; overrides: ${overrides.join(", ")}` : ""}\n- Agents: ${state.agents.length} (${writableCount} with write access to the shared checkout, ${state.agents.length - writableCount} read-only)\n- Structured reports: ${structuredCount}/${state.agents.length}${stillRunning.length > 0 ? `\n- Still running: ${stillRunning.join(", ")} (you will receive an automatic follow-up when they finish; collect again then)` : ""}`;
+
+		// The whole output must fit both limits without a final cut, because cutting the assembled text
+		// drops the last agents. Reserve the header, every possible truncation note, the separators and
+		// the caller's framing first, then share what is left: every agent gets an equal share of bytes
+		// and of lines (it was told that share at launch), and unused share goes to longer sections.
+		const notes = sections.map((section) => `\n\n[Section truncated. Full source: ${section.sourcePath}]`);
+		const separator = "\n\n---\n\n";
+		const fullOutputPath = join(state.runDir, "collection.md");
+		const trailer = `\n\n[${sections.length} section(s) truncated to fit the output limit. Full collection: ${fullOutputPath}]`;
+		const byteLength = (text: string) => Buffer.byteLength(text, "utf8");
+		const lineBreaks = (text: string) => text.split("\n").length - 1;
+		const fixed = [header, "\n\n", ...notes, separator.repeat(sections.length - 1), trailer];
+		const byteBudget = DEFAULT_MAX_BYTES - FRAMING_BYTES - fixed.reduce((sum, text) => sum + byteLength(text), 0);
+		const lineBudget = DEFAULT_MAX_LINES - FRAMING_LINES - 1 - fixed.reduce((sum, text) => sum + lineBreaks(text), 0);
+		const byteBudgets = allocateBudgets(sections.map((section) => byteLength(section.text)), byteBudget);
+		const lineBudgets = allocateBudgets(sections.map((section) => lineBreaks(section.text) + 1), lineBudget);
 		let clippedCount = 0;
 		const limited = sections.map((section, index) => {
-			const clipped = clipToBytes(section.text, budgets[index]);
+			const clipped = clipSection(section.text, byteBudgets[index], lineBudgets[index]);
 			if (clipped === section.text) return clipped;
 			clippedCount++;
-			return `${clipped}\n\n[Section truncated. Full source: ${section.sourcePath}]`;
+			return `${clipped}${notes[index]}`;
 		});
-
-		const writableCount = state.agents.filter((agent) => agent.writableRoots).length;
-		const overrides = state.agents.filter((agent) => agent.model).map((agent) => `${agent.label}=${agent.model}`);
-		const header = `## Herdr squad collection\n- Squad: ${state.squadId}\n- Tabs: ${state.tabs.map((tab) => tab.tabLabel).join(", ") || "None"}\n- Model: ${state.model ?? "Pi default"} (${state.modelSource})${overrides.length > 0 ? `; overrides: ${overrides.join(", ")}` : ""}\n- Agents: ${state.agents.length} (${writableCount} with write access to the shared checkout, ${state.agents.length - writableCount} read-only)\n- Structured reports: ${structuredCount}/${state.agents.length}${stillRunning.length > 0 ? `\n- Still running: ${stillRunning.join(", ")} (you will receive an automatic follow-up when they finish; collect again then)` : ""}`;
-		const truncation = truncateHead(`${header}\n\n${limited.join("\n\n---\n\n")}`, { maxBytes: DEFAULT_MAX_BYTES - 500, maxLines: DEFAULT_MAX_LINES });
-		let output = truncation.content;
-		let fullOutputPath: string | undefined;
-		if (clippedCount > 0 || truncation.truncated) {
-			fullOutputPath = join(state.runDir, "collection.md");
-			const full = `${header}\n\n${sections.map((section) => section.text).join("\n\n---\n\n")}\n`;
-			await withFileMutationQueue(fullOutputPath, () => writeFile(fullOutputPath!, full, { encoding: "utf8", mode: 0o600 }));
-			output += `\n\n[${truncation.truncated ? "Collection" : `${clippedCount} section(s)`} truncated to fit the output limit. Full collection: ${fullOutputPath}]`;
+		let output = `${header}\n\n${limited.join(separator)}`;
+		if (clippedCount > 0) {
+			const full = `${header}\n\n${sections.map((section) => section.text).join(separator)}\n`;
+			await withFileMutationQueue(fullOutputPath, () => writeFile(fullOutputPath, full, { encoding: "utf8", mode: 0o600 }));
+			output += trailer.replace(`${sections.length} section(s)`, `${clippedCount} section(s)`);
 		}
+		return { output, structuredCount, stillRunning, fullOutputPath: clippedCount > 0 ? fullOutputPath : undefined };
+	}
 
+	// Records a collection. "collected" means a tool result handed the reports to the parent;
+	// a follow-up message is only queued, so its squad stays "completed" and wait still returns the reports.
+	function commitCollection(state: SquadState, collection: Awaited<ReturnType<typeof buildCollection>>, delivered: boolean): void {
+		const allStructured = collection.structuredCount === state.agents.length;
 		// Keep watching a partially collected squad so the parent hears when the rest finish.
 		if (state.status !== "closed") {
-			if (structuredCount === state.agents.length || stillRunning.length === 0) state.status = "collected";
+			if (allStructured) state.status = delivered ? "collected" : "completed";
+			else if (collection.stillRunning.length === 0) state.status = "collected";
 			else {
 				state.status = "running";
 				watchSquad(state.squadId);
 			}
 		}
-		if (structuredCount === state.agents.length) {
+		if (allStructured) {
 			delete state.failure;
 			delete state.notifiedProblem;
 		}
-		state.collectedAt = new Date().toISOString();
+		if (delivered) state.collectedAt = new Date().toISOString();
 		saveState(state);
-		return { output, structuredCount, stillRunning, fullOutputPath };
 	}
 
 	pi.registerTool({
@@ -879,12 +912,6 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const state = getSquad(params.squadId);
 			if (state.status === "closed") throw new Error("Cannot wait on a closed squad; collect its saved reports instead");
-			if (state.status === "collected") {
-				return {
-					content: [{ type: "text", text: `Herdr squad ${state.squadId} has no running agents and its results were already delivered. Call herdr_squad_collect to read them again.` }],
-					details: { ...publicSquadDetails(state), timedOut: false },
-				};
-			}
 			const timeoutMs = params.timeoutMs ?? DEFAULT_WAIT_MS;
 			const deadline = Date.now() + timeoutMs;
 
@@ -894,7 +921,13 @@ export default function (pi: ExtensionAPI) {
 					if (signal?.aborted) throw new Error("Herdr squad wait cancelled");
 					const check = await checkSquad(state, signal);
 					if (check.kind === "complete") {
-						const collection = await collectSquad(state, DEFAULT_TERMINAL_LINES, signal);
+						const collection = await buildCollection(state, DEFAULT_TERMINAL_LINES, signal);
+						// A report can be set aside between the check and the read; then keep waiting.
+						if (collection.structuredCount !== state.agents.length) {
+							await delay(POLL_INTERVAL_MS, signal);
+							continue;
+						}
+						commitCollection(state, collection, true);
 						return {
 							content: [{ type: "text", text: `All ${check.completeCount} Herdr squad reports are included below. ${AFTER_REPORTS_HINT}\n\n${collection.output}` }],
 							details: { ...publicSquadDetails(state), completeCount: check.completeCount, fullOutputPath: collection.fullOutputPath, timedOut: false },
@@ -982,7 +1015,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: CollectParams,
 		async execute(_toolCallId, params, signal) {
 			const state = getSquad(params.squadId);
-			const collection = await collectSquad(state, params.lines ?? DEFAULT_TERMINAL_LINES, signal);
+			const collection = await buildCollection(state, params.lines ?? DEFAULT_TERMINAL_LINES, signal);
+			commitCollection(state, collection, true);
 			return {
 				content: [{ type: "text", text: collection.output }],
 				details: {
